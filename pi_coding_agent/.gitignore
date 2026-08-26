@@ -1,0 +1,36 @@
+# local launchers that carry credentials — never commit
+run.local.sh
+stitcher_token.json
+stitcher_auth_pending.json
+
+# Dependencies
+node_modules/
+__pycache__/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.log
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Env / secrets (keep an .env.example if you add one)
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# package.json + package-lock.json ARE committed (do not ignore)

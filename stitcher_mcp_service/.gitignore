@@ -1,0 +1,58 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments (uv creates .venv per project)
+.venv/
+venv/
+env/
+ENV/
+
+# uv: uv.lock and .python-version ARE committed (do not ignore)
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.cache
+
+# Environments / secrets (keep an .env.example if you add one)
+.env
+.env.*
+!.env.example
+
+# Local OIDC auth state (held by this package's server)
+stitcher_token.json
+stitcher_auth_pending.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
