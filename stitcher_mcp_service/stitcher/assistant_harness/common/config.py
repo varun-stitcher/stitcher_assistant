@@ -1,4 +1,5 @@
 """Stitcher runtime scope, bound from ``STITCHER_*`` env vars via pydantic."""
+
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings

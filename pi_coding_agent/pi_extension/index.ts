@@ -12,25 +12,33 @@
  *
  * Load:  pi --model stitcher/<model> -e ./pi_extension/index.ts   (see run.sh)
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import { listTools, callTool } from "./mcpClient.mjs";
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { Type, type TSchema } from 'typebox';
+import { listTools, callTool } from './mcpClient.mjs';
 
-const BASE_URL = process.env.STITCHER_MODEL_BASE_URL || "https://app.dev.stitcher.ai/llm/v1";
-const MODEL = process.env.STITCHER_MODEL_NAME || "qwen3.6-27b-mtp";
+const BASE_URL = process.env.STITCHER_MODEL_BASE_URL || 'https://app.dev.stitcher.ai/llm/v1';
+const MODEL = process.env.STITCHER_MODEL_NAME || 'qwen3.6-27b-mtp';
 
 // Minimal JSON-Schema properties -> TypeBox (string/number/integer/boolean/array).
 // Good enough for the thin wrapper; the server re-validates anyway.
-function toTypebox(schema) {
-  const props = (schema && schema.properties) || {};
-  const out = {};
+type JsonSchemaProperty = { type?: string };
+type JsonSchema = { properties?: Record<string, JsonSchemaProperty> };
+
+function toTypebox(schema: JsonSchema): TSchema {
+  const props: Record<string, JsonSchemaProperty> = (schema && schema.properties) || {};
+  const out: Record<string, TSchema> = {};
   for (const [k, v] of Object.entries(props)) {
     const t = v && v.type;
-    out[k] = t === "number" ? Type.Number()
-      : t === "integer" ? Type.Integer()
-      : t === "boolean" ? Type.Boolean()
-      : t === "array" ? Type.Array(Type.Any())
-      : Type.String();
+    out[k] =
+      t === 'number'
+        ? Type.Number()
+        : t === 'integer'
+          ? Type.Integer()
+          : t === 'boolean'
+            ? Type.Boolean()
+            : t === 'array'
+              ? Type.Array(Type.Any())
+              : Type.String();
   }
   return Type.Object(out);
 }
@@ -39,23 +47,26 @@ export default async function (pi: ExtensionAPI) {
   // The Stitcher-hosted qwen gateway (LiteLLM). Creds come from the env, never
   // hardcoded. Gateway keeps the system-first 400 trap: keep exactly one system
   // message. The x-litellm-tags header satisfies the sai_tag_guard.
-  pi.registerProvider("stitcher", {
-    name: "Stitcher LiteLLM gateway",
+  pi.registerProvider('stitcher', {
+    name: 'Stitcher LiteLLM gateway',
     baseUrl: BASE_URL,
-    apiKey: "$STITCHER_MODEL_API_KEY",
-    api: "openai-completions",
+    apiKey: '$STITCHER_MODEL_API_KEY',
+    api: 'openai-completions',
     headers: {
-      "x-litellm-tags": "sai_team:sai,sai_product:coordination_workflow,sai_product_step:config_generation_llm,sai_effort:medium",
+      'x-litellm-tags':
+        'sai_team:sai,sai_product:coordination_workflow,sai_product_step:config_generation_llm,sai_effort:medium',
     },
-    models: [{
-      id: MODEL,
-      name: MODEL,
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 262144,
-      maxTokens: 16384,
-    }],
+    models: [
+      {
+        id: MODEL,
+        name: MODEL,
+        reasoning: false,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 262144,
+        maxTokens: 16384,
+      },
+    ],
   });
 
   // Proxy every FastMCP tool into pi.
@@ -69,10 +80,11 @@ export default async function (pi: ExtensionAPI) {
       async execute(_toolCallId, params) {
         try {
           const text = await callTool(t.name, params);
-          return { content: [{ type: "text", text }], details: {} };
+          return { content: [{ type: 'text', text }], details: { error: false } };
         } catch (e) {
+          const why = e instanceof Error ? e.message : String(e);
           return {
-            content: [{ type: "text", text: `[stitcher-pi] error calling ${t.name}: ${e?.message || e}` }],
+            content: [{ type: 'text', text: `[stitcher-pi] error calling ${t.name}: ${why}` }],
             details: { error: true },
           };
         }

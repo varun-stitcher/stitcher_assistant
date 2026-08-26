@@ -50,11 +50,13 @@ def register(mcp: FastMCP, auth: OIDCAuth) -> None:
             envs = [envs]
         head = "Live OIDC token" if auth.has_live_token else "Static STITCHER token"
         if not envs:
-            return (f"{head}: NO available-environments claim. The account hasn't been granted any environment"
-                    f" (or the keycloak client doesn't map the claim). Grant access / add the user to the env group, then re-auth.")
+            return (
+                f"{head}: NO available-environments claim. The account hasn't been granted any environment"
+                f" (or the keycloak client doesn't map the claim). Grant access / add the user to the env group, then re-auth."
+            )
         lines = [f"{head}: {len(envs)} environment(s) accessible"]
-        for e in sorted(envs):
-            lines.append(f"  - {e}  {'<-- STITCHER_ENVIRONMENT_ID' if e == auth.s.environment_id else ''}")
+        for env in sorted(envs):
+            lines.append(f"  - {env}  {'<-- STITCHER_ENVIRONMENT_ID' if env == auth.s.environment_id else ''}")
         return "\n".join(lines)
 
     @mcp.tool
@@ -70,7 +72,7 @@ def register(mcp: FastMCP, auth: OIDCAuth) -> None:
             pass
         head = "Live OIDC token" if auth.has_live_token else "Static STITCHER token"
         if exp:
-            remaining = datetime.datetime.fromtimestamp(exp, datetime.timezone.utc) - datetime.datetime.now(datetime.timezone.utc)
+            remaining = datetime.datetime.fromtimestamp(exp, datetime.UTC) - datetime.datetime.now(datetime.UTC)
             return f"{head} — expires in ~{max(0, int(remaining.total_seconds() // 60))} min"
         return f"{head} — expiry unknown"
 

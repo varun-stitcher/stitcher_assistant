@@ -14,6 +14,7 @@ calling its ``register(mcp, ...)``; the pi extension discovers it automatically.
 Run as stdio:                    python mcp_server.py
 Run as Streamable HTTP (run.sh): python mcp_server.py --http 8791
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,16 +22,14 @@ import pathlib
 
 from fastmcp import FastMCP
 
+from .common.client import StitcherClient
 from .common.config import StitcherSettings
 from .common.oidc_auth import OIDCAuth
-from .common.client import StitcherClient
-from .tools import file_tools
-from .tools import stitcher_tools
-from .tools import auth_tools
+from .tools import auth_tools, file_tools, stitcher_tools
 
 
 def build_server() -> FastMCP:
-    settings = StitcherSettings()          # refuses to start without STITCHER_* scope
+    settings = StitcherSettings()  # refuses to start without STITCHER_* scope
     auth = OIDCAuth(settings, pathlib.Path(__file__).resolve().parent)
     mcp = FastMCP(name="stitcher-pi-tools")
     file_tools.register(mcp)
@@ -41,8 +40,14 @@ def build_server() -> FastMCP:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="stitcher-pi-tools FastMCP server")
-    ap.add_argument("--http", type=int, nargs="?", const=8791, default=None,
-                    help="serve over Streamable HTTP on the given port (default 8791)")
+    ap.add_argument(
+        "--http",
+        type=int,
+        nargs="?",
+        const=8791,
+        default=None,
+        help="serve over Streamable HTTP on the given port (default 8791)",
+    )
     ap.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default 127.0.0.1)")
     args = ap.parse_args()
 

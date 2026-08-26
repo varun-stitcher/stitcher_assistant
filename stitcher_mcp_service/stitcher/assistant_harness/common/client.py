@@ -4,6 +4,7 @@ Holds no query logic of its own; it just builds an authenticated ApiClient from
 the runtime scope (settings) + current token (OIDCAuth) and forwards to the
 generated client's methods. All determinism stays in the generated client.
 """
+
 from __future__ import annotations
 
 from stitcher.webservice.client import ApiClient, Configuration
@@ -62,9 +63,7 @@ class StitcherClient:
             return f"ERR: scope must be 'datasources' | 'destinations' (got {scope!r})"
         try:
             with ApiClient(self._configuration()) as client:
-                resp = self._connections_api(client).list_data_connections(
-                    environment=env, type=DataConnType(scope)
-                )
+                resp = self._connections_api(client).list_data_connections(environment=env, type=DataConnType(scope))
         except Exception as e:  # noqa: BLE001
             return f"ERR: {e}"
         items = resp.objects or []

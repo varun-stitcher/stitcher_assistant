@@ -19,7 +19,7 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool
     def now_utc() -> str:
         """Current UTC timestamp (ISO-8601)."""
-        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return datetime.datetime.now(datetime.UTC).isoformat()
 
     @mcp.tool
     def system_info() -> dict:

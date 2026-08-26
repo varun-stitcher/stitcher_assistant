@@ -12,6 +12,7 @@ State is intentionally a long-lived object shared by every MCP tool-call handler
 and the background callback thread (a login started in one tool call is consumed
 by an unrelated HTTP request later) — NOT a ``contextmanager`` scope.
 """
+
 from __future__ import annotations
 
 import base64
@@ -33,14 +34,14 @@ from .config import StitcherSettings
 class _CallbackServer(ThreadingHTTPServer):
     """HTTP server that carries a reference back to the owning OIDCAuth."""
 
-    auth: "OIDCAuth"
+    auth: OIDCAuth
 
 
 class _OIDCCallback(BaseHTTPRequestHandler):
     """Handles GET /callback?code=...&state=... from the Keycloak redirect."""
 
     @property
-    def auth(self) -> "OIDCAuth":
+    def auth(self) -> OIDCAuth:
         return self.server.auth  # type: ignore[attr-defined]
 
     def do_GET(self) -> None:  # noqa: N802
@@ -49,8 +50,10 @@ class _OIDCCallback(BaseHTTPRequestHandler):
         if parsed.path != "/callback":
             self._reply(404, "not found")
             return
-        code = (params.get("code") or [None])[0]
-        state = (params.get("state") or [None])[0]
+        code_list = params.get("code")
+        state_list = params.get("state")
+        code: str | None = code_list[0] if code_list else None
+        state: str | None = state_list[0] if state_list else None
         # Resolve the code_verifier for this authorization code. PKCE is the real
         # secret (the code is useless without it); `state` is belt-and-suspenders.
         # 1) exact state in memory -> 2) exact state in the shared pending file ->
@@ -63,7 +66,10 @@ class _OIDCCallback(BaseHTTPRequestHandler):
         if verifier is None and self.auth._pending_states:
             verifier = next(iter(self.auth._pending_states.values()))
         if not code or not verifier:
-            self._reply(400, "no in-progress login matches this callback — run auth_get_url and complete the NEWEST login (or free port 8086 if a stale one is serving)")
+            self._reply(
+                400,
+                "no in-progress login matches this callback — run auth_get_url and complete the NEWEST login (or free port 8086 if a stale one is serving)",
+            )
             return
         try:
             tokens = httpx.post(
@@ -121,7 +127,7 @@ class OIDCAuth:
     def _origin(self) -> str:
         """Keycloak base for OIDC discovery. STITCHER_AUTH_URL, else api_url minus any /v1."""
         base = (self.s.auth_url or self.s.api_url).rstrip("/")
-        return base[: -3] if base.endswith("/v1") else base
+        return base[:-3] if base.endswith("/v1") else base
 
     def _redirect_uri(self) -> str:
         return f"http://127.0.0.1:{self.s.oauth_callback_port}/callback"
@@ -167,7 +173,7 @@ class OIDCAuth:
 
     def _is_expired(self, token: str) -> bool:
         exp = self._jwt_exp(token)
-        return exp is not None and (exp - 60) <= datetime.datetime.now(datetime.timezone.utc).timestamp()
+        return exp is not None and (exp - 60) <= datetime.datetime.now(datetime.UTC).timestamp()
 
     def _refresh_access_token(self) -> None:
         if not self._refresh_token:
