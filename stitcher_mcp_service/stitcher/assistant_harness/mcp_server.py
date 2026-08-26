@@ -18,6 +18,7 @@ Run as Streamable HTTP (run.sh): python mcp_server.py --http 8791
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 
 from fastmcp import FastMCP
@@ -25,16 +26,27 @@ from fastmcp import FastMCP
 from .common.client import StitcherClient
 from .common.config import StitcherSettings
 from .common.oidc_auth import OIDCAuth
-from .tools import auth_tools, file_tools, stitcher_tools
+from .tools import auth_tools, file_tools, focus_normalization_tools, focus_validation_tools, stitcher_tools
 
 
 def build_server() -> FastMCP:
+    # Reuse the Stitcher LLM gateway for the custom-cost / FOCUS tools instead of
+    # failing on a missing external LLM key. The harness already exports
+    # STITCHER_MODEL_BASE_URL/API_KEY/NAME for the pi model; route the tools' LLM
+    # calls to that same gateway. Only default it on — an explicit
+    # USE_STITCHER_MODEL=false (or an intentionally external LLM_* / USE_STITCHER_MODEL
+    # unset with no gateway key) is still honored.
+    if os.environ.get("STITCHER_MODEL_API_KEY") and "USE_STITCHER_MODEL" not in os.environ:
+        os.environ["USE_STITCHER_MODEL"] = "true"
+
     settings = StitcherSettings()  # refuses to start without STITCHER_* scope
     auth = OIDCAuth(settings, pathlib.Path(__file__).resolve().parent)
     mcp = FastMCP(name="stitcher-pi-tools")
     file_tools.register(mcp)
     stitcher_tools.register(mcp, StitcherClient(settings, auth))
     auth_tools.register(mcp, auth)
+    focus_normalization_tools.register(mcp)
+    focus_validation_tools.register(mcp)
     return mcp
 
 
