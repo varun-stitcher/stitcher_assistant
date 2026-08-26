@@ -1,3 +1,6 @@
+# local launchers that carry credentials — never commit
+run.local.sh
+
 # Dependencies
 node_modules/
 
