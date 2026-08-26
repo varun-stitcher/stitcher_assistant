@@ -7,6 +7,14 @@ registers onto the shared FastMCP instance here:
     stitcher_tools — stitcher_context / list_connections / get_connection / get_pipeline
     auth_tools     — auth_get_url / auth_environments / auth_status / auth_set_token
 
+This is the **top-level** coordinator. It intentionally stays small / pristine:
+heavy, domain-specific tools (e.g. the FOCUS normalization + validation pipeline)
+live in **sub-MCP servers** under ``sub_mcp_agents/`` (see
+``sub_mcp_agents/custom_cost/custom_cost_mcp_server.py``). The pi extension
+registers each sub-MCP's tools as *inactive* and activates them on demand via
+``activate_sub_mcp`` (pi's native Dynamic Tool Loading) so the agent's initial
+tool list stays minimal.
+
 State lives in the ``OIDCAuth`` and ``StitcherClient`` instances owned here — no
 module globals. Add a tool by writing it in the right module (or new module) and
 calling its ``register(mcp, ...)``; the pi extension discovers it automatically.
@@ -26,7 +34,7 @@ from fastmcp import FastMCP
 from .common.client import StitcherClient
 from .common.config import StitcherSettings
 from .common.oidc_auth import OIDCAuth
-from .tools import auth_tools, file_tools, focus_normalization_tools, focus_validation_tools, stitcher_tools
+from .tools import auth_tools, file_tools, stitcher_tools
 
 
 def build_server() -> FastMCP:
@@ -45,8 +53,12 @@ def build_server() -> FastMCP:
     file_tools.register(mcp)
     stitcher_tools.register(mcp, StitcherClient(settings, auth))
     auth_tools.register(mcp, auth)
-    focus_normalization_tools.register(mcp)
-    focus_validation_tools.register(mcp)
+    # NOTE: heavy domain tools (focus_normalization_tools, focus_validation_tools,
+    # conversion_tools, plan_generation_tools) are NOT registered here — they live
+    # in the custom_cost sub-MCP server's own tools/ package
+    # (sub_mcp_agents/custom_cost/tools/) and are activated on demand via
+    # `activate_sub_mcp`. Keeping this surface small keeps the
+    # agent's initial system prompt / tool list pristine.
     return mcp
 
 

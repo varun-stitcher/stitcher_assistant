@@ -51,7 +51,7 @@ import time
 from typing import Any
 
 import polars as pl
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,7 @@ async def _maybe_infer_currency(raw_df: pl.DataFrame) -> str | None:
 def register(mcp: FastMCP) -> None:
     @mcp.tool
     async def validate_and_repair_focus(
+        ctx: Context,
         file_path: str | None = None,
         pdf_b64: str | None = None,
         filename: str | None = None,
@@ -153,26 +154,36 @@ def register(mcp: FastMCP) -> None:
         llm_repair: bool = False,
         max_sample_rows: int = 5,
     ) -> dict[str, Any]:
-        """Validate a normalized FOCUS frame and repair deterministic gaps.
+        """Validate a normalized FOCUS frame and repair deterministic gaps (e.g. currency).
 
-        Refuses by construction: any missing mandatory FOCUS column or any
-        failing FOCUS v1.2 check makes the result ``compliant=false``. Repairs
-        are deterministic (append a constant column) and every repair is
-        re-validated; unverifiable repairs are rolled back and reported.
+        Refuses by construction: any missing mandatory FOCUS column or any failing
+        FOCUS v1.2 check makes the result ``compliant=false``. Repairs are
+        deterministic (append a constant column) and every repair is re-validated;
+        unverifiable repairs are rolled back and reported.
 
-        Pass the invoice ONE of:
-          * ``file_path`` / ``pdf_b64``+``filename`` — re-extract + normalize
-            inside this tool (makes LLM calls for extraction/plan-gen); OR
-          * ``raw_df_json`` — validate/repair an already-normalized frame from a
-            prior ``normalize_to_focus`` call (zero LLM calls with
-            ``llm_repair=false``).
+        **Recommended — repair an existing frame (ZERO LLM, fast, no re-extraction):**
+        after a ``normalize_to_focus`` call, pass its ``normalized_df_summary`` as
+        ``raw_df_json`` plus ``billing_currency``:
 
-        ``billing_currency`` (ISO 4217, e.g. "GBP") repairs a missing
+            validate_and_repair_focus(
+                raw_df_json=<normalize_to_focus(...)["normalized_df_summary"]>,
+                billing_currency="CAD",
+            )
+
+        This validates the frame and deterministically repairs BillingCurrency to
+        CAD, re-validates, and makes ZERO LLM calls (easy to test, never times out).
+
+        Alternative — run the full pipeline inside this tool: pass ``file_path`` /
+        ``pdf_b64``+``filename`` to re-extract + normalize first (makes LLM calls
+        for extraction/plan-gen — slow, and may time out on large/generic invoices).
+        Only use this when you need to (re)normalize AND validate in one call.
+
+        ``billing_currency`` (ISO 4217, e.g. "CAD") repairs a missing
         ``BillingCurrency`` deterministically. With ``llm_repair=true`` and no
         explicit currency, the tool infers one from the raw data (the only LLM
-        call this tool makes — always gated to a valid ISO code and
-        re-validated). ``llm_repair=false`` (default) makes ZERO LLM calls — the
-        human escape hatch.
+        call this tool makes — always gated to a valid ISO code and re-validated).
+        ``llm_repair=false`` (default) makes ZERO LLM calls on the ``raw_df_json``
+        path — the human escape hatch.
         """
         t0 = time.time()
 
@@ -233,6 +244,10 @@ def register(mcp: FastMCP) -> None:
                         if raw_df.is_empty():
                             return _err("CSV file is empty.")
                     else:
+                        await ctx.report_progress(1, 3, "Extracting + normalizing invoice...")
+                        invalid = fnt._validate_pdf(temp_path)
+                        if invalid:
+                            return _err(invalid)
                         extracted, _provider = await fnt._extract_raw_df(temp_path)
                         if extracted.is_empty():
                             return _err("PDF extraction returned no rows.")
@@ -246,9 +261,17 @@ def register(mcp: FastMCP) -> None:
                             pass
         except Exception as e:  # noqa: BLE001
             logger.exception("validate_and_repair_focus: extraction/normalize failed")
+            if isinstance(e, TimeoutError) or "TimeoutError" in type(e).__name__:
+                return _err(
+                    "the re-extract + plan-gen step timed out. If you already have a "
+                    "normalized frame from normalize_to_focus, pass its normalized_df_summary "
+                    "as `raw_df_json` (+ `billing_currency`) instead — that validates + repairs "
+                    "deterministically with ZERO LLM calls and won't time out."
+                )
             return _err(f"Pipeline failed: {type(e).__name__}: {str(e)[:500]}")
 
         # ── Validate (NEVER swallow) ───────────────────────────────────
+        await ctx.report_progress(2, 3, "Validating against FOCUS v1.2 spec...")
         try:
             initial_report = validate_focus(raw_df, source=source)
         except Exception as e:  # noqa: BLE001
@@ -261,7 +284,19 @@ def register(mcp: FastMCP) -> None:
 
         repairs: list[dict[str, Any]] = []
         # ── Repair pass (deterministic; optional LLM for currency only) ─
-        if not initial_compliant and "BillingCurrency" in initial_missing:
+        # Repairs fill a MISSING BillingCurrency, OR override an existing one when
+        # the caller explicitly passes a different ``billing_currency`` (deterministic
+        # override — e.g. the LLM read "USD" from the invoice but the user says CAD).
+        existing_currency = (
+            raw_df["BillingCurrency"].drop_nulls().first() if "BillingCurrency" in raw_df.columns else None
+        )
+        currency_missing = "BillingCurrency" in initial_missing
+        caller_override = (
+            currency_value is not None
+            and not currency_missing
+            and str(existing_currency).strip().upper() != currency_value
+        )
+        if currency_missing or caller_override:
             value = currency_value
             if value is None and llm_repair:
                 value = await _maybe_infer_currency(raw_df)
@@ -272,6 +307,9 @@ def register(mcp: FastMCP) -> None:
                         "method": "set_static_value",
                         "value": value,
                         "source": "caller" if currency_value else "llm_inferred",
+                        "reason": (
+                            "missing" if currency_missing else f"override {existing_currency} -> {currency_value}"
+                        ),
                     }
                 )
 
@@ -315,6 +353,8 @@ def register(mcp: FastMCP) -> None:
         final_missing = _missing_mandatory(final_df)
         final_failed = _failed_checks(final_report)
         final_compliant = not final_missing and not final_failed
+
+        await ctx.report_progress(3, 3, "Done.")
 
         def _serialize(df: pl.DataFrame) -> dict[str, Any]:
             sample = df.head(max_sample_rows)

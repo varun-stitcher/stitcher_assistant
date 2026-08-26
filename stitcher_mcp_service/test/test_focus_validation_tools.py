@@ -22,7 +22,7 @@ import json
 
 import polars as pl
 
-from stitcher.assistant_harness.tools import focus_validation_tools as fvt
+from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools import focus_validation_tools as fvt
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -68,9 +68,7 @@ def test_validator_exception_is_hard_failure_not_none(monkeypatch):
     monkeypatch.setattr(fvt, "validate_focus", _boom)
 
     result = asyncio_run(
-        fvt_register().call_tool(
-            "validate_and_repair_focus", {"raw_df_json": _df_blob(_minimal_focus_df())}
-        )
+        fvt_register().call_tool("validate_and_repair_focus", {"raw_df_json": _df_blob(_minimal_focus_df())})
     )
     payload = _payload(result)
     assert payload["success"] is False, "validator crash must be a hard failure"
@@ -87,9 +85,7 @@ def test_validator_exception_is_hard_failure_not_none(monkeypatch):
 def test_missing_mandatory_column_is_noncompliant():
     df = _minimal_focus_df(missing=["BillingCurrency"])
     result = asyncio_run(
-        fvt_register().call_tool(
-            "validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False}
-        )
+        fvt_register().call_tool("validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False})
     )
     payload = _payload(result)
     assert payload["success"] is True  # tool itself ran
@@ -107,9 +103,7 @@ def test_no_silent_currency_fallback_without_llm():
     must remain missing and be reported — never filled with a hardcoded default."""
     df = _minimal_focus_df(missing=["BillingCurrency"])
     result = asyncio_run(
-        fvt_register().call_tool(
-            "validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False}
-        )
+        fvt_register().call_tool("validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False})
     )
     payload = _payload(result)
     assert payload["repairs_applied"] == []  # nothing silently applied
@@ -204,15 +198,56 @@ def test_compliant_frame_is_compliant_no_repair():
     LLM calls — the happy path that should never need a repair."""
     df = _minimal_focus_df()
     result = asyncio_run(
-        fvt_register().call_tool(
-            "validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False}
-        )
+        fvt_register().call_tool("validate_and_repair_focus", {"raw_df_json": _df_blob(df), "llm_repair": False})
     )
     payload = _payload(result)
     assert payload["success"] is True
     assert payload["compliant"] is True
     assert payload["repairs_applied"] == []
     assert payload["llm_calls_made"] is False
+
+
+# ── B7: explicit currency overrides an existing (wrong) value ──────────────
+
+
+def test_explicit_currency_overrides_existing_value():
+    """The user says the currency should be CAD, but the frame says GBP (the LLM
+    mis-read it). Passing ``billing_currency="CAD"`` must deterministically OVERRIDE
+    the present value to CAD (zero LLM), not only fill a missing one."""
+    df = _minimal_focus_df()  # BillingCurrency="GBP" present
+    result = asyncio_run(
+        fvt_register().call_tool(
+            "validate_and_repair_focus",
+            {"raw_df_json": _df_blob(df), "billing_currency": "CAD", "llm_repair": False},
+        )
+    )
+    payload = _payload(result)
+    kept = payload["repairs_kept"]
+    assert kept and kept[0]["column"] == "BillingCurrency"
+    assert kept[0]["value"] == "CAD"
+    assert kept[0]["source"] == "caller"
+    assert "override" in kept[0].get("reason", "")
+    # The repair actually landed in the frame.
+    row = payload["normalized_df_summary"]["sample_rows"][0]
+    assert row["BillingCurrency"] == "CAD"
+    assert payload["llm_calls_made"] is False
+    assert payload["repairs_rolled_back"] == []
+
+
+def test_same_explicit_currency_is_noop_override():
+    """Passing the currency that is already present must NOT trigger a repair
+    (idempotent override) — no churn, nothing reported as applied."""
+    df = _minimal_focus_df()  # BillingCurrency="GBP" present
+    result = asyncio_run(
+        fvt_register().call_tool(
+            "validate_and_repair_focus",
+            {"raw_df_json": _df_blob(df), "billing_currency": "GBP", "llm_repair": False},
+        )
+    )
+    payload = _payload(result)
+    assert payload["repairs_applied"] == []
+    assert payload["compliant"] is True
+    assert payload["repairs_kept"] == []
 
 
 # ── plumbing helpers ────────────────────────────────────────────────────────
