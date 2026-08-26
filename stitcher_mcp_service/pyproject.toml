@@ -1,0 +1,36 @@
+[project]
+name = "stitcher-mcp-service"
+version = "0.1.0"
+description = "Stitcher MCP service, built on the operation executor."
+requires-python = "~=3.11.0"  # torch CPU wheels below are cp311-only
+dependencies = [
+    "stitcher-operation-executor>=0.4,<0.5",
+    # torch CPU wheel, transitive via SOE; uv requires URL deps mirrored at the root.
+    "torch @ https://download.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch @ https://download.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torch @ https://download.pytorch.org/whl/cpu/torch-2.12.0-cp311-cp311-macosx_14_0_arm64.whl ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[dependency-groups]
+dev = ["pytest>=7.4.0,<8", "pytest-asyncio"]
+
+[tool.uv]
+package = false          # consumer app, not a published wheel
+prerelease = "allow"     # otel-resourcedetector-gcp only ships a prerelease
+
+[[tool.uv.index]]
+name = "stitcher_pypi"
+url = "https://us-east1-python.pkg.dev/stitcher-ci-cd/stitcher-prod-python-repo/simple"
+publish-url = "https://us-east1-python.pkg.dev/stitcher-ci-cd/stitcher-prod-python-repo"
+
+# Local editable in-tree; each falls back to stitcher_pypi if its line is removed.
+# uv sources are root-only, so SOE's full sibling set is restated here.
+[tool.uv.sources]
+stitcher-operation-executor = { path = "../../stitcher_operation_executor", editable = true }
+stitcher-webservice-common  = { path = "../../webservice_common", editable = true }
+stitcher-web-service-client = { path = "../../stitcher_web_service_client", editable = true }
+stitcher-pipeline-common    = { path = "../../stitcher_pipeline_common", editable = true }
+stitcher-commons            = { path = "../../stitcher_commons", editable = true }
+stitcher_focus_converter    = { path = "../../stitcher_focus_converters/focus_converter_base", editable = true }
+stitcher-polars-plugin      = { index = "stitcher_pypi" }
+s3fs                        = { git = "https://github.com/varunmittal91/s3fs.git", branch = "issue-empty-dir" }

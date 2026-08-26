@@ -1,0 +1,11 @@
+{
+  "name": "stitcher-pi-extension",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Stitcher pi agent extension: register the Stitcher LLM provider from env and proxy every FastMCP tool into pi.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
