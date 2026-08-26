@@ -41,6 +41,10 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local OIDC auth state (held by this package's server)
+stitcher_token.json
+stitcher_auth_pending.json
+
 # Jupyter
 .ipynb_checkpoints/
 

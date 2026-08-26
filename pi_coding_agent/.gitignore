@@ -1,8 +1,11 @@
 # local launchers that carry credentials — never commit
 run.local.sh
+stitcher_token.json
+stitcher_auth_pending.json
 
 # Dependencies
 node_modules/
+__pycache__/
 
 # Logs
 npm-debug.log*
