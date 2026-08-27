@@ -434,6 +434,21 @@ def test_allocation_not_computed_without_alloc_columns(server, monkeypatch):
 
 
 # ── C8.5: SQL row_count must survive the render path (regression) ───────────
+def test_cost_center_report_honors_period(server, monkeypatch):
+    """The tool's ``period`` arg must reach the window resolution — a YYYY-MM period must render
+    the month label, never silently fall back to the rolling since_days window."""
+    txt = _call(
+        server,
+        "chargeback_by_cost_center",
+        {"data_source": "focus", "period": "2026-07"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_SVC_SCHEMA,
+        df=_FOCUS_SVC_ROWS,
+    )
+    assert "ERR" not in txt
+    assert "# Chargeback by cost center — July 2026" in txt
+
+
 def test_share_table_preserves_sql_row_count(server, monkeypatch):
     """When read_aggregated_cost returns the SQL frame (with row_count), the rendered rows column
     and the 'N charge records in window' line must reflect the SQL COUNT(*) — never collapse to 1

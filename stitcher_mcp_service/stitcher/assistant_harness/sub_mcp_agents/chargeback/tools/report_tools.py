@@ -262,6 +262,8 @@ def register(mcp: FastMCP, client, soe) -> None:
                 period_column=period_column,
                 cost_center_column=cost_center_column,
                 org_column=org_column,
+                period=period,
+                since_days=since_days,
             )
         except cm.ToolRefusal as exc:
             return str(exc)
@@ -416,6 +418,8 @@ def register(mcp: FastMCP, client, soe) -> None:
                     org_column=org_column,
                     provider_column=provider_column,
                     cost_center=cost_center,
+                    period=period,
+                    since_days=since_days,
                 )
             )
         except cm.ToolRefusal as exc:
