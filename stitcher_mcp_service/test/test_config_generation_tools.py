@@ -28,14 +28,14 @@ import asyncio
 import pytest
 from fastmcp import FastMCP
 
+from stitcher.assistant_harness.common import soe_context as soe_mod
 from stitcher.assistant_harness.sub_mcp_agents.config_generation.tools import (
     authoring_tools as at,
-    committed_config_tools as cc,
     operator_tools as ot,
     planning_tools as pt,
 )
-from stitcher.assistant_harness.common import soe_context as soe_mod
-from stitcher.assistant_harness.sub_mcp_agents.config_generation.tools import (
+from stitcher.assistant_harness.tools import (
+    committed_config_tools as cc,
     data_source_tools as dst,
 )
 

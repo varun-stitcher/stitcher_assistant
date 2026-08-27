@@ -1,4 +1,4 @@
-"""Data-source + metadata + scan tools for the config_generation sub-MCP.
+"""Common data-source + metadata + scan tools for the top-level MCP.
 
 Grounds on the REAL environment by exercising SOE functions **as-is**:
 

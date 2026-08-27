@@ -133,9 +133,8 @@ events via `ctx.report_progress()` like `custom_cost`'s `normalize_to_focus`.
 - Add `CONFIG_GEN_PORT="${STITCHER_CONFIG_GEN_MCP_PORT:-8793}"`, start the server, add to
   `STITCHER_SUB_MCP_URLS`: `"config_generation":"http://127.0.0.1:${CONFIG_GEN_PORT}/mcp/"`.
 - `_kill_port "$CONFIG_GEN_PORT"` + `_wait_mcp "$CONFIG_GEN_PORT"` (mirror custom_cost).
-- Copy SOE env files into `pi_coding_agent/.soe-env/.env.local` + `.env.local.dev`
-  (gitignored), and have `soe_context` load them (path resolved relative to the package so it
-  works regardless of CWD). Document the copy step in README + run.sh preflight.
+- Symlink SOE `.env.local` / `.env.local.dev` into `pi_coding_agent/` so `ExecutorConfig` /
+  `WebserviceCommonSettings` read them from the launcher CWD directly (no `.soe-env` copy).
 
 ## Files to modify / create
 - **New** `stitcher_mcp_service/stitcher/assistant_harness/sub_mcp_agents/config_generation/__init__.py`
@@ -149,8 +148,8 @@ events via `ctx.report_progress()` like `custom_cost`'s `normalize_to_focus`.
 - **New** `.../config_generation/tools/authoring_tools.py` (`generate_lookup`, `generate_filter`, `validate_config`, `save_config`)
 - **New** `stitcher_mcp_service/test/test_config_generation_tools.py`
 - **Edit** `pi_coding_agent/run.sh` (start server, port, `STITCHER_SUB_MCP_URLS`, preflight copy of SOE env)
-- **Edit** `pi_coding_agent/.gitignore` (ignore `.soe-env/`)
-- **Edit** `pi_coding_agent/README.md` (document the new sub-MCP + SOE env copy)
+- **Edit** `pi_coding_agent/.gitignore` (ignore `.output/`)
+- **Edit** `pi_coding_agent/README.md` (document the new sub-MCP + symlinked SOE env)
 - (optional) `stitcher_mcp_service/.../common/config.py` add `STITCHER_CONFIG_GEN_MCP_PORT`
 
 ## Reuse (existing, with paths)
@@ -195,7 +194,8 @@ events via `ctx.report_progress()` like `custom_cost`'s `normalize_to_focus`.
     only). Live `DataConnectionUtil`/`get_vsc_commit_dir` calls are network-gated (Keycloak JWT +
     GitHub App auth) and need a real environment — verified constructibility only.
 - [x] **Step 2 — `soe_context.py`.** DONE. `tools/soe_context.py` loads the broadened SOE env var set
-  (ExecutorConfig + WebserviceCommonSettings) from `.soe-env/` (copied from SOE, gitignored) →
+  (ExecutorConfig + WebserviceCommonSettings) from the launcher CWD (symlinked `.env.local` /
+  `.env.local.dev`) →
   `ExecutorConfig` → caches a hand-built `WorkflowContext`; resolves `pipeline_id` lazily via the
   client. Smoke-tested: 19 vars loaded, ExecutorConfig + WorkflowContext build, pipeline_id resolves.
 - [x] **Step 3 — server skeleton.** DONE. `config_generation_mcp_server.py` (`build_server`/`main`,
@@ -234,9 +234,9 @@ events via `ctx.report_progress()` like `custom_cost`'s `normalize_to_focus`.
   empty-ops refuse; save round-trips. Adversarial tests written in `test/test_config_generation_tools.py`.
 - [x] **Step 9 — docs + preflight.** DONE. README sub-MCP section documents the `config_generation`
   bundle (all 5 tool groups), the SOE-env copy steps, `activate_sub_mcp("config_generation")`;
-  env-var table rows for `STITCHER_CONFIG_GEN_MCP_PORT` / `STITCHER_SOE_ENV_DIR` /
-  `STITCHER_OUTPUT_DIR`. `run.sh` preflight warns if `.soe-env/` is missing (non-fatal). `.soe-env/`
-  + `.output/` gitignored. `.soe-env` seeded with the two SOE env files. Final: 13 tools registered;
+  env-var table rows for `STITCHER_CONFIG_GEN_MCP_PORT` / `STITCHER_OUTPUT_DIR`. `run.sh` launches
+  the sub-MCP from `pi_coding_agent/` where `.env.local` / `.env.local.dev` are symlinked, so
+  `ExecutorConfig` reads them from the CWD. `.output/` gitignored. Final: 13 tools registered;
   `bash -n run.sh` OK. (Full `./run.sh` manual run needs `pi` CLI + real env creds — component-level
   e2e verified.)
 

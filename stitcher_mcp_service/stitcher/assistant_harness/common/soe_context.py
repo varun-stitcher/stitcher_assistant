@@ -3,24 +3,18 @@
 Configured-generation and other sub-MCP flows ground on the REAL environment by exercising SOE
 functions directly (``ExtractRefDataSubOperator`` schema/reads, ``get_vsc_commit_dir``) — not
 vendored copies. Those functions take a ``WorkflowContext`` + rely on ``ExecutorConfig()`` /
-``WebserviceCommonSettings()``, both of which read SOE ``.env.local`` / ``.env.local.dev``. This
-module loads those env files into ``os.environ`` (a broadened superset of the harness's
-``_NEEDED_VARS`` — see spike Step 1) BEFORE the first ``ExecutorConfig()`` /
-``WebserviceCommonSettings()`` construction, then builds and caches a hand-built ``WorkflowContext``
-(a pydantic ``BaseModel``, constructible outside Temporal — verified by the Step 1 spike: no
-``workflow.info()`` / ``activity.`` calls in the target functions).
-
-Env-file resolution order (first existing wins):
-  1. ``STITCHER_SOE_ENV_DIR`` (explicit; point at a copied set for portability)
-  2. ``<repo_root>/stitcher_assistant/pi_coding_agent/.soe-env`` (the plan's local copy, gitignored)
-  3. ``<repo_root>/stitcher_operation_executor`` (the SOE dir itself — "as is")
+``WebserviceCommonSettings()``, both of which are pydantic-settings ``BaseSettings`` that load
+``.env.local`` / ``.env.local.dev`` from the **current working directory** — exactly the way SOE
+itself runs. The launcher (``run.sh``) therefore starts this sub-MCP from the SOE dir so those env
+files are resolved as-is; there is no manual env-file parsing here. This module builds and caches a
+hand-built ``WorkflowContext`` (a pydantic ``BaseModel``, constructible outside Temporal — verified
+by the Step 1 spike: no ``workflow.info()`` / ``activity.`` calls in the target functions).
 
 SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) is read from ``SAI_ENV_CONTEXT``
 (a JSON blob, mirroring ``pi_agent_coding_harness/server/env_context.py``) with per-field fallback to
 ``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_ID`` / ``STITCHER_GIT_BRANCH`` / ``STITCHER_AUTH_TENANT``.
 ``pipeline_id`` is resolved lazily from the pipeline name via ``StitcherClient`` when missing.
 """
-
 from __future__ import annotations
 
 import json
@@ -28,144 +22,14 @@ import logging
 import os
 import pathlib
 import uuid
-from datetime import date
-from functools import lru_cache
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── env-file loader ────────────────────────────────────────────────────────────
-# ExecutorConfig (StitcherBaseConfigClass) + WebserviceCommonSettings both read SOE .env files.
-# We load a whitelisted superset of the scalar vars both need, skipping the multi-line K8S JSON blob
-# (line-by-line parsing chokes on it — same reason the harness restricts to a whitelist). The set
-# below is the harness's ExecutorConfig vars PLUS the WebserviceCommonSettings / vault vars the
-# DataConnectionUtil + get_vsc_commit_dir paths additionally require (Step 1 spike finding).
-_SOE_ENV_VARS: set[str] = {
-    # ExecutorConfig (DataProcessingBasePathsConfig / StitcherServiceURLConfig / pairing accounts)
-    "BASE_PATH",
-    "BASE_TEMP_PATH",
-    "LONG_TERM_STORAGE_BASE_PATH",
-    "GCS_EXTRACTED_DATA_CACHE",
-    "GCS_TEMP_PROXY_FOR_GCP_OPERATIONS",
-    "SWS_URL",
-    "SWS_ADMIN_URL",
-    "APP_BASE_URL",
-    "SSL_CA_CERTIFICATE_PATH",
-    "LOG_LEVEL",
-    "EXECUTOR",
-    "NAMESPACE_SUFFIX",
-    "AWS_PAIRING_ACCOUNT_ID",
-    "GCP_SERVICE_ACCOUNT_PROJECT_ID",
-    "GCP_GKE_SERVICE_ACCOUNT_PROJECT_ID",
-    # WebserviceCommonSettings (DataConnectionUtil JWT + get_vsc_commit_dir auth)
-    "VAULT_ROLE_TEMPLATE_CLASS",
-    "OPENID_SA_CLIENT_ID",
-    "OPENID_SA_CLIENT_SECRET",
-    "KEYCLOAK_URL",
-    "VAULT_URL",
-    "AWS_ROLE_NAME_SUFFIX",
-}
-
-# Path-valued vars whose RELATIVE values are relative to the SOE dir (the `.env.local` files use
-# e.g. `SSL_CA_CERTIFICATE_PATH=../local/certs/ca.crt`, intended relative to `stitcher_operation_executor/`,
-# NOT to CWD). When the sub-MCP runs from a different CWD we absolutize them against the SOE dir so
-# ExecutorConfig's `FilePath` validation passes regardless of where run.sh launched from.
-_PATH_VARS: set[str] = {
-    "SSL_CA_CERTIFICATE_PATH",
-    "BASE_PATH",
-    "BASE_TEMP_PATH",
-    "LONG_TERM_STORAGE_BASE_PATH",
-    "GCS_EXTRACTED_DATA_CACHE",
-    "GCS_TEMP_PROXY_FOR_GCP_OPERATIONS",
-}
-
-
-def _find_repo_root() -> pathlib.Path:
-    """Walk up from this file until a dir containing both ``stitcher_operation_executor`` and
-    ``stitcher_pipeline_common`` is found (the superrepo root). Falls back to the package's
-    parents[7] (this module's depth from the root) if the marker walk fails."""
-    here = pathlib.Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "stitcher_operation_executor").is_dir() and (parent / "stitcher_pipeline_common").is_dir():
-            return parent
-    return here.parents[7]
-
-
-_REPO_ROOT = _find_repo_root()
-_SOE_DIR = _REPO_ROOT / "stitcher_operation_executor"
-_LOCAL_SOE_ENV = _REPO_ROOT / "stitcher_assistant" / "pi_coding_agent" / ".soe-env"
-
-
-def _soe_env_dir() -> pathlib.Path:
-    """Where to read SOE ``.env.local`` / ``.env.local.dev`` from (first existing wins)."""
-    explicit = os.environ.get("STITCHER_SOE_ENV_DIR")
-    if explicit:
-        p = pathlib.Path(explicit).expanduser()
-        if p.is_dir():
-            return p
-    if _LOCAL_SOE_ENV.is_dir():
-        return _LOCAL_SOE_ENV
-    return _SOE_DIR
-
-
-def _load_soe_env_files() -> list[str]:
-    """Load the whitelisted scalar SOE env vars into ``os.environ`` (idempotent — never overwrites
-    an already-set var so an explicit caller override wins). Returns the list of keys loaded."""
-    env_dir = _soe_env_dir()
-    loaded: list[str] = []
-    for env_name in (".env.local", ".env.local.dev"):
-        env_path = env_dir / env_name
-        if not env_path.exists():
-            logger.debug("SOE env file not found: %s", env_path)
-            continue
-        try:
-            text = env_path.read_text()
-        except OSError as e:
-            logger.warning("could not read %s: %s", env_path, e)
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            if k not in _SOE_ENV_VARS:
-                continue
-            v = v.strip().strip('"').strip("'")
-            # absolutize relative path vars against the SOE dir (where the .env.local's relative
-            # paths are anchored, e.g. '../local/certs/ca.crt') so FilePath validation passes from any CWD
-            if k in _PATH_VARS and v and not os.path.isabs(v):
-                v = str((_SOE_DIR / v).resolve())
-            # skip obviously-multiline JSON blobs (a value starting with '{' across many lines)
-            if v and k not in os.environ:
-                os.environ[k] = v
-                loaded.append(k)
-    return loaded
-
-
-_loaded_once = False
-
-
-def ensure_soe_env_loaded() -> list[str]:
-    """Load SOE env files once (before the first ExecutorConfig/WebserviceCommonSettings use).
-    Safe to call repeatedly; only loads the first time."""
-    global _loaded_once
-    if _loaded_once:
-        return []
-    loaded = _load_soe_env_files()
-    _loaded_once = True
-    if loaded:
-        logger.info("SOE env loaded from %s: %d var(s)", _soe_env_dir(), len(loaded))
-    return loaded
-
-
-@lru_cache(maxsize=1)
-def get_executor_config():
-    """Cached ``ExecutorConfig()``. MUST be called after ``ensure_soe_env_loaded()``."""
-    from stitcher.operation_executor.config.executor_config import ExecutorConfig
-
-    return ExecutorConfig()
-
+# Where the save_config tool writes authored configs (a local, gitignored dir): anchored to the
+# pi_coding_agent dir via this module's location (parents[4] = stitcher_assistant), independent of
+# the server's CWD. Overridable via STITCHER_OUTPUT_DIR.
+_OUTPUT_DIR = pathlib.Path(__file__).resolve().parents[4] / "pi_coding_agent" / ".output"
 
 # ── SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) ──────────
 
@@ -184,7 +48,7 @@ def _read_env_context() -> dict[str, Any]:
 
 
 class SoeContext:
-    """Holds the SOE scope + lazily-built ``WorkflowContext`` for the config-gen tools.
+    """Holds the SOE scope + lazily-built ``WorkflowContext`` for the sub-MCP tools.
 
     Constructed once in ``build_server()`` from the top-level ``StitcherSettings`` /
     ``OIDCAuth`` / ``StitcherClient`` (env-scoped, like the top-level coordinator) and passed
@@ -201,16 +65,10 @@ class SoeContext:
         self.pipeline_name: str = str(ctx.get("pipeline_name") or settings.pipeline_name or "")
         self.branch: str = str(ctx.get("branch") or os.environ.get("STITCHER_GIT_BRANCH") or "main")
         self.auth_tenant: str = str(ctx.get("auth_tenant") or os.environ.get("STITCHER_AUTH_TENANT") or "")
-        # Where authored configs are written by the save_config tool (a local, gitignored dir).
-        self.output_dir: str = str(
-            pathlib.Path(
-                os.environ.get("STITCHER_OUTPUT_DIR")
-                or (_REPO_ROOT / "stitcher_assistant" / "pi_coding_agent" / ".output")
-            )
-        )
+        self.output_dir: str = str(pathlib.Path(os.environ.get("STITCHER_OUTPUT_DIR") or _OUTPUT_DIR))
         self._workflow_context = None
         self._pipeline_id_resolved = False
-        self.pipeline_resolve_error: str = ""  # why pipeline_id could NOT be resolved (for diagnostics)
+        self.pipeline_resolve_error: str = ""
 
     # ── scope checks ──────────────────────────────────────────────────────────
 
@@ -382,7 +240,6 @@ class SoeContext:
                 self.auth_tenant or "(UNSET — SOE reads/metadata/scan/git-config will FAIL with 'Realm does not exist')"
             ),
             f"scoped: {'yes' if self.is_scoped else 'no'}",
-            f"soe_env_dir: {_soe_env_dir()}",
         ]
         if self.is_scoped and not self.has_pipeline:
             lines.append(
@@ -394,6 +251,5 @@ class SoeContext:
 
 
 def build_soe_context(settings, auth, client) -> SoeContext:
-    """Construct the singleton SoeContext, loading SOE env files first."""
-    ensure_soe_env_loaded()
+    """Construct the SoeContext (SOE env files are resolved by BaseSettings from the server CWD)."""
     return SoeContext(settings, auth, client)

@@ -268,7 +268,6 @@ def register(mcp: FastMCP, client, soe) -> None:
             logger.exception("plan_enhance_operations: LLM call failed")
             return f"ERR: enhance planning LLM call failed: {type(e).__name__}: {str(e)[:500]}"
 
-        # Deterministic guard
         await ctx.report_progress(2, 2, "Guarding the plan against the real metadata...")
         dropped = _guard(plan, stage, cols, dss, biz_cols)
         dropped_sig = {(d.get("operation_type"), d.get("name")) for d in dropped}

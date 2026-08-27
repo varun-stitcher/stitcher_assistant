@@ -1,4 +1,4 @@
-"""Prior committed-config tools for the config_generation sub-MCP.
+"""Common committed-config tools for the top-level MCP.
 
 Grounds on the REAL prior checked-in git config for this environment + pipeline by exercising SOE
 ``get_vsc_commit_dir`` **as-is** (SWS pipeline lookup + GitHub App auth + per-stage loader), then

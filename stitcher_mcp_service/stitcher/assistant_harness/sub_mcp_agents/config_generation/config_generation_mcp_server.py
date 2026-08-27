@@ -19,10 +19,12 @@ reused from SPC + SOE **as-is** (no vendored copies); pi stays a thin caller.
 
 Tool modules (each ``register(mcp, client, soe)``):
   - operator_tools        — list_operators / describe_operator / environment_context
-  - data_source_tools     — list_data_sources / get_data_source_metadata / scan_data
-  - committed_config_tools — get_committed_config / derived_columns
   - planning_tools        — plan_enhance_operations (LLM-assisted)
   - authoring_tools       — generate_lookup / generate_filter / validate_config / save_config
+
+Note: the datasource/metadata/scan tools (data_source_tools) and the committed-config tools
+(committed_config_tools) now live on the TOP-LEVEL MCP (``assistant_harness/tools/``) and are
+always available — they are NOT part of this sub-MCP any more.
 
 Run standalone (stdio):  python -m stitcher.assistant_harness.sub_mcp_agents.config_generation.config_generation_mcp_server
 Run over HTTP (run.sh):   ... --http 8793
@@ -42,8 +44,6 @@ from ...common.oidc_auth import OIDCAuth
 from ...common.soe_context import build_soe_context
 from .tools import (
     authoring_tools,
-    committed_config_tools,
-    data_source_tools,
     operator_tools,
     planning_tools,
 )
@@ -71,8 +71,6 @@ def build_server() -> FastMCP:
 
     mcp = FastMCP(name=f"stitcher-pi-tools/{SERVER_NAME}")
     operator_tools.register(mcp, client, soe)
-    data_source_tools.register(mcp, client, soe)
-    committed_config_tools.register(mcp, client, soe)
     planning_tools.register(mcp, client, soe)
     authoring_tools.register(mcp, client, soe)
     return mcp

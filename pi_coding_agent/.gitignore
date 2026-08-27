@@ -27,9 +27,6 @@ coverage/
 .env.*
 !.env.example
 
-# SOE env copies used by the config_generation sub-MCP to exercise SOE functions as-is
-.soe-env/
-
 # Authored configs written by the config_generation save_config tool
 .output/
 
