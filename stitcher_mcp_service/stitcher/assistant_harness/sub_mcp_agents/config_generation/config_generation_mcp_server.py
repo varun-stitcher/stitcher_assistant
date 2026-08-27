@@ -8,7 +8,7 @@ keeping the top-level tool list pristine.
 
 Unlike ``custom_cost`` (env-agnostic), this server is **environment-scoped**: config generation
 always operates on a customer environment, so ``build_server()`` instantiates
-``StitcherSettings`` / ``OIDCAuth`` / ``StitcherClient`` (same as the top-level ``mcp_server.py``)
+``StitcherAssistantConfig`` / ``OIDCAuth`` / ``StitcherClient`` (same as the top-level ``mcp_server.py``)
 and refuses to start without ``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_NAME``.
 
 The flow (per the plan): understand the user requirement → figure out the best operations → call
@@ -33,13 +33,12 @@ Run over HTTP (run.sh):   ... --http 8793
 from __future__ import annotations
 
 import argparse
-import os
 import pathlib
 
 from fastmcp import FastMCP
 
 from ...common.client import StitcherClient
-from ...common.config import StitcherSettings
+from ...common.config import StitcherAssistantConfig
 from ...common.oidc_auth import OIDCAuth
 from ...common.soe_context import build_soe_context
 from .tools import (
@@ -55,13 +54,13 @@ SERVER_NAME = "config_generation"
 
 
 def build_server() -> FastMCP:
+    settings = StitcherAssistantConfig()
+    settings.require_scope()  # env-scoped, like top-level: refuse to start without STITCHER_* scope
     # Reuse the Stitcher LLM gateway for the planning tool's LLM call instead of failing on a
     # missing external LLM key — mirrors the top-level + custom_cost servers. Only default it on;
     # an explicit USE_STITCHER_MODEL=false is still honored.
-    if os.environ.get("STITCHER_MODEL_API_KEY") and "USE_STITCHER_MODEL" not in os.environ:
-        os.environ["USE_STITCHER_MODEL"] = "true"
+    settings.export_llm_env()
 
-    settings = StitcherSettings()  # refuses to start without STITCHER_* scope (env-scoped, like top-level)
     # Share the top-level assistant_harness/ state dir so the OIDC token the agent mints via the
     # top-level `auth_get_url` is reused here (one login, both servers).
     state_dir = pathlib.Path(__file__).resolve().parents[2]  # .../assistant_harness/

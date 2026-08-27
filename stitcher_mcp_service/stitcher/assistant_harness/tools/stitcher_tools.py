@@ -3,12 +3,10 @@ the existing stitcher_web_service_client). Register on the mcp server."""
 
 from __future__ import annotations
 
-import json
-import os
-
 from fastmcp import FastMCP
 
 from ..common.client import StitcherClient
+from ..common.config import StitcherAssistantConfig
 
 # Capabilities catalog for the always-active `stitcher_capabilities` tool. Each
 # sub-MCP bundle hosts tools that are INACTIVE until activated via
@@ -44,7 +42,7 @@ _SUB_MCP_CATALOG = {
 }
 
 
-def register(mcp: FastMCP, client: StitcherClient) -> None:
+def register(mcp: FastMCP, client: StitcherClient, settings: StitcherAssistantConfig) -> None:
     @mcp.tool
     def stitcher_capabilities() -> str:
         """Discover the heavy sub-MCP tool bundles and how to activate them.
@@ -56,10 +54,7 @@ def register(mcp: FastMCP, client: StitcherClient) -> None:
         (e.g. normalize an invoice to FOCUS): it lists each bundle, the tools it
         hosts, and the exact activation call.
         """
-        try:
-            registry = json.loads(os.environ.get("STITCHER_SUB_MCP_URLS", "{}"))
-        except json.JSONDecodeError:
-            registry = {}
+        registry = settings.sub_mcp_registry
         if not registry:
             return (
                 "No sub-MCP bundles are configured (STITCHER_SUB_MCP_URLS is empty). "

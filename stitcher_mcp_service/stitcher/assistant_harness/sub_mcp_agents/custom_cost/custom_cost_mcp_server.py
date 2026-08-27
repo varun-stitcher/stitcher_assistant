@@ -15,7 +15,7 @@ Why a separate server (not just more tools on the top-level server):
     is isolated in its own process — a crash or slow LLM call there can never
     wedge the coordinator tools (auth, stitcher API, file);
   * it is environment-agnostic: this server does NOT instantiate
-    ``StitcherSettings`` / ``OIDCAuth``. custom-cost is pure LLM normalization
+    ``StitcherAssistantConfig`` / ``OIDCAuth``. custom-cost is pure LLM normalization
     and is not bound to a Stitcher environment, so it must not require
     ``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_NAME`` to start.
 
@@ -37,10 +37,10 @@ Run over HTTP (run.sh):   ... --http 8792
 from __future__ import annotations
 
 import argparse
-import os
 
 from fastmcp import FastMCP
 
+from ...common.config import StitcherAssistantConfig
 from .tools import (
     conversion_tools,
     extract_tools,
@@ -58,10 +58,8 @@ SERVER_NAME = "custom_cost"
 def build_server() -> FastMCP:
     # Reuse the Stitcher LLM gateway for the FOCUS tools' LLM calls instead of
     # failing on a missing external LLM key — mirrors the top-level server.
-    # Only default it on; an explicit USE_STITCHER_MODEL=false (or an intentional
-    # external LLM_* / unset gateway key) is still honored.
-    if os.environ.get("STITCHER_MODEL_API_KEY") and "USE_STITCHER_MODEL" not in os.environ:
-        os.environ["USE_STITCHER_MODEL"] = "true"
+    # Only default it on; an explicit USE_STITCHER_MODEL=false is still honored.
+    StitcherAssistantConfig().export_llm_env()
 
     mcp = FastMCP(name=f"stitcher-pi-tools/{SERVER_NAME}")
     conversion_tools.register(mcp)

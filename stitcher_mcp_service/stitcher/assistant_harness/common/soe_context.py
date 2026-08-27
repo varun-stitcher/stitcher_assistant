@@ -10,19 +10,18 @@ files are resolved as-is; there is no manual env-file parsing here. This module 
 hand-built ``WorkflowContext`` (a pydantic ``BaseModel``, constructible outside Temporal — verified
 by the Step 1 spike: no ``workflow.info()`` / ``activity.`` calls in the target functions).
 
-SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) is read from ``SAI_ENV_CONTEXT``
-(a JSON blob, mirroring ``pi_agent_coding_harness/server/env_context.py``) with per-field fallback to
-``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_ID`` / ``STITCHER_GIT_BRANCH`` / ``STITCHER_AUTH_TENANT``.
-``pipeline_id`` is resolved lazily from the pipeline name via ``StitcherClient`` when missing.
+SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) is read from ``StitcherAssistantConfig``
+(``SAI_ENV_CONTEXT`` JSON — mirroring ``pi_agent_coding_harness/server/env_context.py`` — with per-field
+fallback to ``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_ID`` / ``STITCHER_GIT_BRANCH`` /
+``STITCHER_AUTH_TENANT``). ``pipeline_id`` is resolved lazily from the pipeline name via ``StitcherClient``
+when missing.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
 import pathlib
 import uuid
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,24 +32,10 @@ _OUTPUT_DIR = pathlib.Path(__file__).resolve().parents[4] / "pi_coding_agent" / 
 
 # ── SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) ──────────
 
-
-def _read_env_context() -> dict[str, Any]:
-    """Read the SOE env tuple from ``SAI_ENV_CONTEXT`` (JSON) if present, else {}."""
-    raw = os.environ.get("SAI_ENV_CONTEXT", "")
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("SAI_ENV_CONTEXT is not valid JSON; ignoring")
-        return {}
-
-
 class SoeContext:
     """Holds the SOE scope + lazily-built ``WorkflowContext`` for the sub-MCP tools.
 
-    Constructed once in ``build_server()`` from the top-level ``StitcherSettings`` /
+    Constructed once in ``build_server()`` from the top-level ``StitcherAssistantConfig`` /
     ``OIDCAuth`` / ``StitcherClient`` (env-scoped, like the top-level coordinator) and passed
     to each tool module's ``register(mcp, client, soe)``.
     """
@@ -59,13 +44,13 @@ class SoeContext:
         self.s = settings
         self.auth = auth
         self.client = client
-        ctx = _read_env_context()
+        ctx = settings.env_context  # SAI_ENV_CONTEXT JSON, parsed by StitcherAssistantConfig
         self.environment_id: str = str(ctx.get("environment_id") or settings.environment_id or "")
-        self.pipeline_id: Optional[str] = str(ctx.get("pipeline_id") or os.environ.get("STITCHER_PIPELINE_ID") or "")
+        self.pipeline_id: Optional[str] = str(ctx.get("pipeline_id") or settings.pipeline_id or "")
         self.pipeline_name: str = str(ctx.get("pipeline_name") or settings.pipeline_name or "")
-        self.branch: str = str(ctx.get("branch") or os.environ.get("STITCHER_GIT_BRANCH") or "main")
-        self.auth_tenant: str = str(ctx.get("auth_tenant") or os.environ.get("STITCHER_AUTH_TENANT") or "")
-        self.output_dir: str = str(pathlib.Path(os.environ.get("STITCHER_OUTPUT_DIR") or _OUTPUT_DIR))
+        self.branch: str = str(ctx.get("branch") or settings.git_branch or "main")
+        self.auth_tenant: str = str(ctx.get("auth_tenant") or settings.auth_tenant or "")
+        self.output_dir: str = str(pathlib.Path(settings.output_dir or _OUTPUT_DIR))
         self._workflow_context = None
         self._pipeline_id_resolved = False
         self.pipeline_resolve_error: str = ""

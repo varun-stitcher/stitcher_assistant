@@ -23,7 +23,7 @@ pi (the loop) ──MCP──▶ stitcher.assistant_harness.mcp_server (ONE Fast
                            ├─ tools/auth_tools.py             (OIDC login)
                            ├─ tools/data_source_tools.py      (list_data_sources / get_data_source_metadata / scan_data)
                            ├─ tools/committed_config_tools.py (get_committed_config / derived_columns)
-                           └─ common/                         (OIDCAuth, StitcherClient, StitcherSettings, SoeContext)
+                           └─ common/                         (OIDCAuth, StitcherClient, StitcherAssistantConfig, SoeContext)
                          mounts /sub_mcp_agents/custom_cost/mcp        (custom_cost — FOCUS bundle, on demand)
                          mounts /sub_mcp_agents/config_generation/mcp  (config_generation — enhance authoring, on demand)
           -- every MCP is served by this ONE process; sub-MCP tools stay inactive until
@@ -82,7 +82,7 @@ Visible to the agent at startup:
     extraction / plan-gen output on repeat calls (zero LLM).
 
 A sub-MCP is environment-agnostic — it does **not** instantiate
-`StitcherSettings`/`OIDCAuth`, so it can start without `STITCHER_ENVIRONMENT_ID`
+`StitcherAssistantConfig`/`OIDCAuth`, so it can start without `STITCHER_ENVIRONMENT_ID`
 / `STITCHER_PIPELINE_NAME`. Only the LLM gateway env (`STITCHER_MODEL_*`) is
 needed for the custom_cost tools' LLM calls.
 

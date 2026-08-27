@@ -20,7 +20,7 @@ Design (mirrors the harness constitution):
     these tools only orchestrate + serialize.
   * refuse by construction — bad input (missing file, unknown provider, malformed
     plan/config) returns a clear ``success=false`` error; never a silent default.
-  * environment-agnostic — no StitcherSettings / OIDCAuth. These are pure data
+  * environment-agnostic — no StitcherAssistantConfig / OIDCAuth. These are pure data
     conversions, not bound to a Stitcher environment, so the sub-MCP can start
     without STITCHER_ENVIRONMENT_ID / STITCHER_PIPELINE_NAME.
   * one artifact per run — reads the caller's data file; never writes unless an

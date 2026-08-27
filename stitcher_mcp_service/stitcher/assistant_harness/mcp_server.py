@@ -38,7 +38,6 @@ Run (the combined server, what run.sh uses):   python mcp_server.py --http 8791
 from __future__ import annotations
 
 import argparse
-import os
 import pathlib
 from contextlib import AsyncExitStack, asynccontextmanager
 
@@ -47,7 +46,7 @@ from fastapi import FastAPI
 from fastmcp import FastMCP
 
 from .common.client import StitcherClient
-from .common.config import StitcherSettings
+from .common.config import StitcherAssistantConfig
 from .common.oidc_auth import OIDCAuth
 from .common.soe_context import build_soe_context
 from .sub_mcp_agents.config_generation import config_generation_mcp_server
@@ -63,22 +62,19 @@ from .tools import (
 
 def build_server() -> FastMCP:
     """Build the top-level coordinator MCP (the common tool surface)."""
-    # Reuse the Stitcher LLM gateway for the custom-cost / FOCUS tools instead of
-    # failing on a missing external LLM key. The harness already exports
-    # STITCHER_MODEL_BASE_URL/API_KEY/NAME for the pi model; route the tools' LLM
-    # calls to that same gateway. Only default it on — an explicit
-    # USE_STITCHER_MODEL=false (or an intentionally external LLM_* / USE_STITCHER_MODEL
-    # unset with no gateway key) is still honored.
-    if os.environ.get("STITCHER_MODEL_API_KEY") and "USE_STITCHER_MODEL" not in os.environ:
-        os.environ["USE_STITCHER_MODEL"] = "true"
+    settings = StitcherAssistantConfig()
+    settings.require_scope()  # refuses to start without STITCHER_* scope (env-scoped coordinator)
+    # Reuse the Stitcher LLM gateway for the custom-cost / FOCUS tools' LLM calls instead of failing
+    # on a missing external LLM key — ``export_llm_env`` sets USE_STITCHER_MODEL=true for the external
+    # SPC LLM config (honoring an explicit USE_STITCHER_MODEL=false).
+    settings.export_llm_env()
 
-    settings = StitcherSettings()  # refuses to start without STITCHER_* scope
     auth = OIDCAuth(settings, pathlib.Path(__file__).resolve().parent)
     client = StitcherClient(settings, auth)
     soe = build_soe_context(settings, auth, client)
     mcp = FastMCP(name="stitcher-pi-tools")
     file_tools.register(mcp)
-    stitcher_tools.register(mcp, client)
+    stitcher_tools.register(mcp, client, settings)
     auth_tools.register(mcp, auth)
     # Common grounding tools (live on the top-level MCP, not a sub-MCP): the live SWS
     # datasource catalog + SOE metadata/scan, and the committed git-config summary +

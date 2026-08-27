@@ -38,8 +38,11 @@ _kill_port "$PORT"
 _kill_port "$OAUTH_PORT"
 sleep 1
 
-# Every STITCHER_* runtime/config variable is REQUIRED — never start without
-# knowing where the agent points and whom it is scoped to. No defaults, no fallback.
+# Every STITCHER_* runtime/config variable is REQUIRED. StitcherAssistantConfig
+# (stitcher_mcp_service/.../common/config.py) reads these from the environment
+# (inherited from run.local.sh / the caller) or .env.local / .env.local.dev, and its
+# require_scope() refuses to start without a scope. The :? guards below are a friendly
+# preflight for the pi model arg + MCP server (no defaults, no silent fallback).
 : "${STITCHER_MODEL_BASE_URL:?set STITCHER_MODEL_BASE_URL (e.g. https://app.dev.stitcher.ai/llm/v1)}"
 : "${STITCHER_MODEL_API_KEY:?set STITCHER_MODEL_API_KEY (gateway key)}"
 : "${STITCHER_MODEL_NAME:?set STITCHER_MODEL_NAME (e.g. qwen3.6-27b-mtp)}"
@@ -61,9 +64,9 @@ if [ -z "${STITCHER_AUTH_TENANT:-}" ]; then
   echo "   with Keycloak 'Realm does not exist'. Set STITCHER_AUTH_TENANT to this env's org/tenant realm." >&2
 fi
 
-export STITCHER_MODEL_BASE_URL STITCHER_MODEL_API_KEY STITCHER_MODEL_NAME
-export STITCHER_API_URL STITCHER_ENVIRONMENT_ID STITCHER_PIPELINE_NAME
-export STITCHER_API_TOKEN STITCHER_SSL_CA_CERTIFICATE_PATH STITCHER_AUTH_TENANT STITCHER_PIPELINE_ID STITCHER_GIT_BRANCH
+# Publish the top-level MCP endpoint to the pi extension. The scope/auth vars are
+# already in the environment (inherited + read by StitcherAssistantConfig), so only
+# the constructed MCP URL needs to be (re)exported here.
 export STITCHER_MCP_URL="http://127.0.0.1:${PORT}/mcp/"
 
 # Sub-MCP registry handed to the pi extension (name -> MCP endpoint URL). Every sub-MCP is served

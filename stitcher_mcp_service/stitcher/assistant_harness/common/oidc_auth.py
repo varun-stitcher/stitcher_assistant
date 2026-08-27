@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 
-from .config import StitcherSettings
+from .config import StitcherAssistantConfig
 
 
 class _CallbackServer(ThreadingHTTPServer):
@@ -107,7 +107,7 @@ class _OIDCCallback(BaseHTTPRequestHandler):
 class OIDCAuth:
     """Holds all auth state + behavior in one place (no module globals)."""
 
-    def __init__(self, settings: StitcherSettings, state_dir: pathlib.Path) -> None:
+    def __init__(self, settings: StitcherAssistantConfig, state_dir: pathlib.Path) -> None:
         self.s = settings
         self._token_file = state_dir / "stitcher_token.json"
         self._pending_file = state_dir / "stitcher_auth_pending.json"

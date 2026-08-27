@@ -11,7 +11,7 @@ Grounds on the REAL environment by exercising SOE functions **as-is**:
   - ``scan_data(name_or_id, ...)`` — read REAL data by connection parameters (polars, projection
     pushdown): group_by+value gives a $ split, columns alone gives a head sample.
 
-Uses ``soe.get_workflow_context()`` (hand-built from ``StitcherSettings``) so every SOE call below
+Uses ``soe.get_workflow_context()`` (hand-built from ``StitcherAssistantConfig``) so every SOE call below
 runs as-is — no Temporal context (Step 1 spike verified these bodies are Temporal-free).
 """
 from __future__ import annotations

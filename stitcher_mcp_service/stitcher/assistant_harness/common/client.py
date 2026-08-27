@@ -14,12 +14,12 @@ from stitcher.webservice.client.api import (
 )
 from stitcher.webservice.client.models import DataConnType
 
-from .config import StitcherSettings
+from .config import StitcherAssistantConfig
 from .oidc_auth import OIDCAuth
 
 
 class StitcherClient:
-    def __init__(self, settings: StitcherSettings, auth: OIDCAuth) -> None:
+    def __init__(self, settings: StitcherAssistantConfig, auth: OIDCAuth) -> None:
         self.s = settings
         self.auth = auth
         self._connections_api = ConnectionDatasourcesDestinationsApi

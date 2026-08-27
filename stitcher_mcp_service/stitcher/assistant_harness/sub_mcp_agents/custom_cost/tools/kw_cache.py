@@ -20,6 +20,7 @@ Design
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -28,8 +29,16 @@ import time
 from typing import Any
 
 
+@functools.lru_cache(maxsize=1)
+def _cache_dir_setting() -> str:
+    """STITCHER_STEP_CACHE_DIR via StitcherAssistantConfig (once); '' when unset."""
+    from ....common.config import StitcherAssistantConfig
+
+    return StitcherAssistantConfig().step_cache_dir
+
+
 def cache_dir() -> pathlib.Path:
-    d = pathlib.Path(os.environ.get("STITCHER_STEP_CACHE_DIR") or pathlib.Path.home() / ".stitcher" / "kw-cache")
+    d = pathlib.Path(_cache_dir_setting() or pathlib.Path.home() / ".stitcher" / "kw-cache")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
