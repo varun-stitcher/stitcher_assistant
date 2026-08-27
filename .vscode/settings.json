@@ -1,0 +1,75 @@
+{
+  "files.exclude": {
+    // pi_coding_agent/.gitignore (local launchers, credentials)
+    "pi_coding_agent/stitcher_token.json": true,
+    "pi_coding_agent/stitcher_auth_pending.json": true,
+    // Dependencies
+    "pi_coding_agent/node_modules": true,
+    "**/__pycache__": true,
+    // Logs
+    "**/*.log": true,
+    // Build output
+    "pi_coding_agent/dist": true,
+    "pi_coding_agent/build": true,
+    "**/*.tsbuildinfo": true,
+    // Test / coverage
+    "pi_coding_agent/coverage": true,
+    "pi_coding_agent/.nyc_output": true,
+    // Env / secrets
+    "**/.env": true,
+    "**/.env.*": true,
+    // Authored configs written by config_generation
+    "pi_coding_agent/.output": true,
+    // Editors / OS
+    "**/.idea": true,
+    "**/*.swp": true,
+    "**/.DS_Store": true,
+
+    // stitcher_mcp_service/.gitignore
+    "**/*.py[cod]": true,
+    "**/*$py.class": true,
+    "**/*.so": true,
+    // Distribution / packaging
+    "stitcher_mcp_service/build": true,
+    "stitcher_mcp_service/dist": true,
+    "stitcher_mcp_service/eggs": true,
+    "stitcher_mcp_service/.eggs": true,
+    "**/*.egg-info": true,
+    "**/*.egg": true,
+    // Virtual environments
+    "stitcher_mcp_service/.venv": true,
+    "stitcher_mcp_service/venv": true,
+    "stitcher_mcp_service/env": true,
+    "stitcher_mcp_service/ENV": true,
+    // Test / coverage / type-check caches
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    "**/.coverage": true,
+    "**/.coverage.*": true,
+    "stitcher_mcp_service/coverage.xml": true,
+    "stitcher_mcp_service/htmlcov": true,
+    "**/.hypothesis": true,
+    "**/.cache": true,
+    // Jupyter
+    "**/.ipynb_checkpoints": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/*.log": true,
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.venv": true,
+    "**/.env": true,
+    "**/.env.*": true
+  },
+  "files.watcherExclude": {
+    "**/__pycache__": true,
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.venv": true,
+    "**/*.log": true
+  }
+}
