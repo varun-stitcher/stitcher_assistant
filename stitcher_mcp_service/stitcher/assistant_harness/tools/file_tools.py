@@ -31,11 +31,24 @@ def register(mcp: FastMCP) -> None:
             "user": os.environ.get("USER", ""),
         }
 
+    # Data-file suffixes the agent is allowed to browse for (invoices / cost extracts).
+    # Source code, configs, and everything else are deliberately hidden so the agent is
+    # tool-bound, not a file browser.
+    _DATA_SUFFIXES = {".pdf", ".csv", ".parquet"}
+
     @mcp.tool
     def list_directory(path: str = ".") -> list[str]:
-        """List the top-level entries of a directory (names only)."""
+        """List a directory's data files (``*.pdf`` / ``*.csv`` / ``*.parquet``) and
+        subdirectories only — names sorted. Source code and other file types are hidden
+        so the agent browses for invoices / cost extracts, not source."""
         try:
-            return sorted(p.name for p in pathlib.Path(path).iterdir())
+            out: list[str] = []
+            for p in pathlib.Path(path).iterdir():
+                if p.is_dir():
+                    out.append(p.name + "/")
+                elif p.suffix.lower() in _DATA_SUFFIXES:
+                    out.append(p.name)
+            return sorted(out)
         except Exception as e:  # noqa: BLE001
             return [f"ERR: {e}"]
 

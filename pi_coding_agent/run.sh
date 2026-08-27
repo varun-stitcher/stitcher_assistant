@@ -29,14 +29,25 @@ OAUTH_PORT="${STITCHER_OAUTH_CALLBACK_PORT:-8086}"
 # Free the port the server (and its local OAuth callback) binds, so a STALE server
 # from a prior run — which would serve OLD code and cause "state mismatch" — can't
 # linger and steal the connections. If these fail (no lsof), that's fine.
+# A stuck uvicorn can ignore SIGTERM, so escalate to SIGKILL and then verify the
+# port is actually free before proceeding (otherwise the new server fails to bind
+# with EADDRINUSE and run.local.sh appears "not working").
 _kill_port() { # $1 = port
   local p
   p=$(lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1) || true
-  [ -n "$p" ] && kill "$p" 2>/dev/null || true
+  [ -z "$p" ] && return 0
+  kill "$p" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    lsof -tiTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+    sleep 0.3
+  done
+  # still held after SIGTERM — force it
+  p=$(lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1) || true
+  [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+  sleep 0.3
 }
 _kill_port "$PORT"
 _kill_port "$OAUTH_PORT"
-sleep 1
 
 # Every STITCHER_* runtime/config variable is REQUIRED. StitcherAssistantConfig
 # (stitcher_mcp_service/.../common/config.py) reads these from the environment
@@ -72,7 +83,7 @@ export STITCHER_MCP_URL="http://127.0.0.1:${PORT}/mcp/"
 # Sub-MCP registry handed to the pi extension (name -> MCP endpoint URL). Every sub-MCP is served
 # by the SAME combined process, mounted under /sub_mcp_agents/<name>/mcp on STITCHER_MCP_PORT.
 # Add more sub-MCP servers here as they're created under sub_mcp_agents/.
-export STITCHER_SUB_MCP_URLS="{\"custom_cost\":\"http://127.0.0.1:${PORT}/sub_mcp_agents/custom_cost/mcp/\",\"config_generation\":\"http://127.0.0.1:${PORT}/sub_mcp_agents/config_generation/mcp/\"}"
+export STITCHER_SUB_MCP_URLS="{\"custom_cost\":\"http://127.0.0.1:${PORT}/sub_mcp_agents/custom_cost/mcp/\",\"config_generation\":\"http://127.0.0.1:${PORT}/sub_mcp_agents/config_generation/mcp/\",\"chargeback\":\"http://127.0.0.1:${PORT}/sub_mcp_agents/chargeback/mcp/\"}"
 
 # (re)start the combined FastMCP server in the background: ONE process on ONE port serves the
 # top-level coordinator (common tools) AND every sub-MCP mounted as an ASGI sub-app at
@@ -100,7 +111,11 @@ _wait_mcp() { # $1 = port
 _wait_mcp "$PORT" || { echo "!! combined MCP server did not come up on $PORT" >&2; exit 1; }
 
 echo "stitcher-pi — model ${STITCHER_MODEL_NAME}, base ${STITCHER_MODEL_BASE_URL}, env ${STITCHER_ENVIRONMENT_ID}, pipeline ${STITCHER_PIPELINE_NAME}, MCP via ${STITCHER_MCP_URL}"
-pi --model "stitcher/${STITCHER_MODEL_NAME}" -e "$PIA_DIR/pi_extension/index.ts"
+# -nbt / --no-builtin-tools: disable pi's built-in read/write/bash/edit so the agent
+# cannot touch source code or the filesystem directly — it may only use the Stitcher MCP
+# tools proxied in by the extension (list_directory / read_text_file / read_pdf / the
+# chargeback / config-gen / custom-cost bundles). Keeps the agent tool-bound, not a shell.
+pi --model "stitcher/${STITCHER_MODEL_NAME}" -nbt -e "$PIA_DIR/pi_extension/index.ts"
 status=$?
 kill "$MCP_PID" 2>/dev/null || true
 exit "$status"

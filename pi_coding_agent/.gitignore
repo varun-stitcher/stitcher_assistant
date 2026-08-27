@@ -1,5 +1,6 @@
 # local launchers that carry credentials — never commit
 run.local.sh
+run_gateway.local.sh
 stitcher_token.json
 stitcher_auth_pending.json
 
@@ -12,6 +13,7 @@ npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
 *.log
+conversation-logs/
 
 # Build output
 dist/

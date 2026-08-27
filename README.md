@@ -48,3 +48,22 @@ quotes), **tsc** (`tsconfig.json`, `--noEmit`). Run via npm scripts too:
 The Python QA tools are standalone (`uv tool install ruff isort black mypy`);
 the Node tools live in `pi_extension/node_modules` (devDependencies in
 `pi_coding_agent/pi_extension/package.json`).
+
+## Expose the agent: higher-order MCP server + OpenAI endpoint
+
+The pi agent (`pi_coding_agent/`) can be exposed as an orchestrator behind two surfaces so
+Claude Code / Claude Desktop and OpenAI-compatible clients can drive it: a **higher-order MCP
+server** (task-typed tools — `generate_enhance_config`, `normalize_invoice_to_focus`,
+`explore_environment`) and an **OpenAI-compatible endpoint** (`/v1/chat/completions`). Both are
+served by one gateway process (`stitcher_mcp_service/stitcher/assistant_harness/gateway.py`)
+that shares a single `AgentRunner` (per-call headless pi turns, per-call scoped tool MCP).
+
+```bash
+cd pi_coding_agent && ./run_gateway.local.sh
+# MCP  :  http://127.0.0.1:8792/mcp/   (register in Claude Code / Claude Desktop)
+# OpenAI: http://127.0.0.1:8880/v1     (/v1/chat/completions, /v1/models, /health)
+```
+
+Every call supplies its own `environment_id` + `pipeline_name` (env-scoped, per-call);
+Claude Code / Desktop config snippets, the task-typed tool schemas, and the structured-output
+contract are documented in [`pi_coding_agent/README.md`](./pi_coding_agent/README.md).

@@ -135,6 +135,44 @@ git-branch fetch); when unset, `common/soe_context` attempts a best-effort looku
 the pipeline name, but an explicit id is more reliable. `environment_context`
 surfaces whether `auth_tenant` is set.
 
+### `chargeback` sub-MCP (cost query + chargeback report/invoice)
+
+Port of SPC's chargeback tools into the pi-router, reading the REAL cost datasource via the SOE
+**extract tools** (the same machinery ``scan_data`` uses — ``ExtractRefDataSubOperator`` +
+``MetadataConsolidateOperator``) and aggregating in polars — NOT the SWS gateway (whose standalone
+`focus_query` method is a stub outside SWS). **Environment-scoped**, so `build_server()`
+instantiates `StitcherAssistantConfig`/`OIDCAuth`/`StitcherClient` + `build_soe_context` and
+refuses to start without `STITCHER_*` scope. Activate with `activate_sub_mcp("chargeback")`.
+
+Every tool takes a `data_source` (name/id from `list_data_sources`) plus column-mapping params
+with FOCUS defaults — so it works against a **raw GCP billing export** (`cost` /
+`usage_start_time` / `project.name`) as well as a FOCUS-normalized table (`BilledCost` /
+`ChargePeriodStart` / `x_CostCenter`). For the GCP export above, that's
+`query_focus_cost(data_source="StitcherAI GCP cost import", group_by="project.name")` or
+`chargeback_by_cost_center(data_source=…, cost_center_column="project.name")`.
+
+- **Grounding:** `discover_cost_schema` — reads the schema (no data scan) and classifies columns
+  into cost/period/org/cost-center/project/provider/allocation buckets, with a suggested mapping.
+- **Reports:** `chargeback_by_billing_account` (top accounts/projects), `chargeback_by_cost_center`
+  (the PRIMARY monthly chargeback / showback table with direct / allocation-in / allocation-out /
+  net lineage + materiality rollup), `chargeback_provider_lineage` (per-CC provider drill-down).
+- **Invoices:** `generate_chargeback_invoices` (one draft per cost center), `discover_erp_integrations`
+  (surfaces the configured ERP + match hints), `submit_invoices_to_erp` (delegation payloads for a
+  connected ERP MCP, or deterministic local confirmations).
+- **Ad-hoc:** `query_focus_cost` — general-purpose cost query by any dimension (unknown
+  `group_by`/missing cost column refused; allocation-* grouping only when the table exposes the
+  matching `x_Allocation*` column).
+
+Allocation lineage (`direct`/`allocation-in`/`allocation-out`) is computed ONLY when the datasource
+exposes `x_AllocationStatusSource`/`Destination` (a FOCUS-normalized table); a raw export reports
+direct cost by dimension with no allocation buckets.
+
+**SOE env files + SA auth.** Same requirements as `config_generation`: launch from
+`pi_coding_agent/` (where `.env.local` / `.env.local.dev` are symlinked) so `ExecutorConfig()` /
+`DataConnectionUtil` resolve, and set `STITCHER_AUTH_TENANT` to this env's Keycloak realm or
+queries fail with `Realm does not exist`. Cost reads are **synchronous** (this sub-MCP has no job
+store) so `start_focus_query` / `focus_query_status` are deliberately NOT ported.
+
 ### Adding a sub-MCP server
 
 1. Drop a new server under `sub_mcp_agents/<name>/<name>_mcp_server.py` with a
@@ -259,3 +297,98 @@ server under `sub_mcp_agents/<name>/` and register them from that server's
 `activate_sub_mcp("<name>")`. See [Sub-MCP servers](#sub-mcp-servers-keeping-the-tool-list-pristine).
 
 All determinism belongs server-side; pi only makes the calls.
+
+## Expose the agent (gateway): higher-order MCP server + OpenAI endpoint
+
+Besides the interactive `run.sh`, you can expose the **agent itself** as an orchestrator so other
+clients can drive it — Claude Code / Claude Desktop over a higher-order MCP server, and
+OpenAI-compatible clients over a REST endpoint. Both are served by ONE process (`gateway.py`),
+sharing one `AgentRunner` that, per call, spawns a **per-call scoped** tool MCP (the combined
+`mcp_server.py`) on an ephemeral port plus a headless `pi -p` turn against it.
+
+```
+Claude Code / Desktop ──MCP :8792 /mcp/──▶  agent gateway  ── per call ──▶ AgentRunner
+OpenAI client ──/v1/chat :8880──▶            (agent is the tool)  ├─ spawn per-call tool MCP (env-scoped)
+                                                                    ├─ spawn pi -p (stitcher extension)
+                                                                    └─ read structured result (submit_result) + saved YAML
+```
+
+**Surfaces**
+
+* **MCP `:8792/mcp/`** — a small set of **task-typed** orchestrator tools; the agent does the
+  orchestration and returns **structured output**:
+  * `generate_enhance_config(environment_id, pipeline_name, requirement, stage)` — author +
+    validate + save an enhance prepare/enrich config.
+  * `normalize_invoice_to_focus(file_path|pdf_b64, …)` — normalize any invoice to FOCUS v1.2.
+  * `explore_environment(environment_id, pipeline_name)` — read-only scout.
+* **OpenAI `:8880/v1`** — `POST /v1/chat/completions` (stream + non-stream) + `/v1/models` +
+  `/health`. Per-call env scope arrives on the non-standard `stitcher` extension
+  `{environment_id, pipeline_name, auth_tenant}`; a request without scope is refused (env-scoped,
+  never a simulated fallback).
+
+**Per-call scope.** Every call supplies its own `environment_id` + `pipeline_name` (config
+generation is environment-scoped). The gateway does **not** bind to one env at startup — each
+orchestrator call spawns its own tool MCP scoped to that call, so one gateway serves many
+environments and is concurrency-safe (distinct ephemeral ports).
+
+**Start it**
+
+```bash
+cd pi_coding_agent
+./run_gateway.local.sh          # local-only (gitignored) with creds; or set the vars and ./run_gateway.sh
+# MCP  :  http://127.0.0.1:8792/mcp/
+# OpenAI: http://127.0.0.1:8880/v1
+curl -s --noproxy '*' http://127.0.0.1:8880/health
+```
+
+Prereqs are the same as `run.sh` (`pi` on PATH, the stitcher_mcp_service venv, the extension's
+node_modules). The gateway inherits `STITCHER_*` from the environment / `run_gateway.local.sh`.
+
+**Claude Code** — add an MCP server to your project's `.mcp.json` (or `claude mcp add`):
+
+```json
+{
+  "mcpServers": {
+    "stitcher-pi-agent": {
+      "type": "http",
+      "url": "http://127.0.0.1:8792/mcp/",
+      "headers": {}
+    }
+  }
+}
+```
+
+Then ask it e.g. *"call generate_enhance_config with environment d7dad3dc-… , pipeline
+finops-main, requirement: enrich AI spend with the owning team"*.
+
+**Claude Desktop** — add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "stitcher-pi-agent": {
+      "type": "http",
+      "url": "http://127.0.0.1:8792/mcp/"
+    }
+  }
+}
+```
+
+**Structured output.** Each task-typed tool returns a typed dict. The agent is instructed (via
+`AGENT_SYSTEM.md`) to end every orchestrator turn by calling the gated `submit_result` tool with
+its structured result; config tasks are additionally cross-checked against the filesystem-harvested
+saved YAML (`save_config` is the only persist). If the agent didn't submit structured output the
+tool reports `status: "no_structured_output"` honestly — never a fabricated default.
+
+**Smoke test** (needs the gateway up):
+
+```bash
+cd pi_extension
+GW_MCP_URL=http://127.0.0.1:8792/mcp/ node ../gateway_mcp_smoke.mjs list
+GW_MCP_URL=http://127.0.0.1:8792/mcp/ node ../gateway_mcp_smoke.mjs explore_environment
+```
+
+Shared code lives in `stitcher_mcp_service/stitcher/assistant_harness/`: `agent_runner.py` (the
+headless pi driver), `agent_mcp_server.py` (the task-typed tools), `openai_server.py` (the OpenAI
+router), `gateway.py` (the two-surface server), and `tools/result_capture.py` (the gated
+`submit_result` tool). 
