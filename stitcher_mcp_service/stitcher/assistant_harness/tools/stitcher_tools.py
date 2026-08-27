@@ -18,7 +18,7 @@ from ..common.config import StitcherAssistantConfig
 _SUB_MCP_CATALOG = {
     "custom_cost": {
         "purpose": "FOCUS cost normalization + validation — bring any invoice PDF/CSV and normalize it to the FOCUS v1.2 column shape.",
-        "activate": "activate_sub_mcp(name=\"custom_cost\")",
+        "activate": 'activate_sub_mcp(name="custom_cost")',
         "tools": {
             "normalize_to_focus(file_path=...)": "Full pipeline: extract → LLM plan-gen → normalize to FOCUS (optional validation). THE entry point for a single invoice.",
             "extract_invoice(file_path=...)": "Run ONLY the extraction step (influence which columns are pulled).",
@@ -30,13 +30,30 @@ _SUB_MCP_CATALOG = {
     },
     "config_generation": {
         "purpose": "Enhance/enrich config generation grounded on the REAL environment by exercising SOE functions as-is.",
-        "activate": "activate_sub_mcp(name=\"config_generation\")",
+        "activate": 'activate_sub_mcp(name="config_generation")',
         "tools": {
             "list_operators / describe_operator": "The enhance operator vocabulary (Lookup, Mapping, Compute, Filter, ...) + full field specs + real examples.",
             "list_data_sources / get_data_source_metadata / scan_data": "Live datasource catalog + columns/dtypes + real $ splits via the SOE metadata/extract operators.",
             "get_committed_config / derived_columns": "Prior checked-in git configs for this env + pipeline (compact op summary + x_* bridge columns).",
             "plan_enhance_operations": "LLM-maps a requirement to the best operation(s), then a deterministic guard.",
             "generate_lookup / generate_filter / validate_config / save_config": "Deterministic, validate-by-construction authoring against the real SPC enhance models.",
+        },
+    },
+    "chargeback": {
+        "purpose": (
+            "Run cloud chargeback / cost reports on the env's FOCUS **destination** — what Stitcher has "
+            "WRITTEN (BigQuery/Snowflake DB export). NEVER scans the source datasources: omit ``data_source`` "
+            "and every tool auto-resolves the env's FOCUS destination. Cost questions ('run chargeback for "
+            "July', 'top services by cost', 'showback') belong HERE, not in list_data_sources/scan_data."
+        ),
+        "activate": 'activate_sub_mcp(name="chargeback")',
+        "tools": {
+            "list_chargeback_destinations()": "GROUND FIRST: the env's queryable FOCUS destinations (e.g. BigQuery Export). Call before any report.",
+            "discover_cost_schema(data_source='')": "Destination schema (hundreds of FOCUS cols) + suggested cost/period/org/cost-center mapping. Confirms column names before reports.",
+            "chargeback_by_cost_center(period='YYYY-MM'|'last_month')": "THE monthly chargeback/showback report: per-cost-center direct / allocation-in / allocation-out + materiality rollup, rendered markdown.",
+            "chargeback_by_billing_account(...) / chargeback_provider_lineage(...)": "Top billing accounts by cost; per-cost-center provider lineage (direct/in/out).",
+            "query_focus_cost(group_by='service', period=...)": "Ad-hoc cost query. Accepts comma-separated dimensions for a cross-tab, e.g. group_by='cost_center,service' → one row per (cost center, service). Aliases: service, provider, billing_account, region, cost_center, organization.",
+            "generate_chargeback_invoices(...) / discover_erp_integrations() / submit_invoices_to_erp(erp_system=...)": "Draft one invoice per cost center, discover the configured ERP (Zoho Books), get the two-phase submit payloads.",
         },
     },
 }
@@ -48,10 +65,11 @@ def register(mcp: FastMCP, client: StitcherClient, settings: StitcherAssistantCo
         """Discover the heavy sub-MCP tool bundles and how to activate them.
 
         The active tool list stays deliberately small; domain bundles (custom_cost
-        FOCUS normalization, config_generation enhance config) live in sub-MCP
-        servers and are INACTIVE until you call ``activate_sub_mcp(<name>)``. Call
-        this tool whenever you need a capability that isn't in your active tools
-        (e.g. normalize an invoice to FOCUS): it lists each bundle, the tools it
+        FOCUS normalization, config_generation enhance config, chargeback cost
+        reports) live in sub-MCP servers and are INACTIVE until you call
+        ``activate_sub_mcp(<name>)``. Call this tool whenever you need a
+        capability that isn't in your active tools (e.g. normalize an invoice to
+        FOCUS, run a chargeback report): it lists each bundle, the tools it
         hosts, and the exact activation call.
         """
         registry = settings.sub_mcp_registry
@@ -82,10 +100,6 @@ def register(mcp: FastMCP, client: StitcherClient, settings: StitcherAssistantCo
         )
         return "\n".join(lines)
 
-    @mcp.tool
-    def stitcher_context() -> str:
-        """Report the Stitcher scope this agent is bound to (API URL, environment id, pipeline name). No secrets."""
-        return client.context()
     @mcp.tool
     def stitcher_context() -> str:
         """Report the Stitcher scope this agent is bound to (API URL, environment id, pipeline name). No secrets."""

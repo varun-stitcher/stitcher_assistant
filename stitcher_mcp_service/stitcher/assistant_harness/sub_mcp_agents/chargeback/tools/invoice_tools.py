@@ -16,10 +16,9 @@ from datetime import date
 import polars as pl
 from fastmcp import FastMCP
 
+from . import common as cm
 from . import cost_reader as cr
 from . import formatting as fmt
-from .period import resolve_period as _resolve_period
-from .schema_tools import _resolve_env_id
 from .settings import (
     CHARGEBACK_POLICY,
     ERP_DOC_BASE,
@@ -45,11 +44,12 @@ async def _build_chargeback_invoices(
     """Build the per-cost-center invoice list with provider-level line items.
 
     Single source of truth for both ``generate_chargeback_invoices`` and
-    ``submit_invoices_to_erp``. Reads the datasource via the SOE extract tools, groups by cost
-    center (+ org + provider), and wraps each cost center as a draft invoice with per-provider line
-    items. Returns ``(kept_invoices, materiality)``.
+    ``submit_invoices_to_erp``. Reads the destination via the SOE focus-query SQL path, groups by
+    cost center (+ org + provider), and wraps each cost center as a draft invoice with per-provider
+    line items. Returns ``(kept_invoices, materiality)``. Raises ``RuntimeError`` on any refusal
+    (the tool prefixes ``ERR``).
     """
-    dc = cr.load_data_connection(soe, data_source)
+    dc = cr.resolve_destination(soe, data_source)
     schema = cr.read_cost_schema(soe, dc)
     if not schema:
         raise RuntimeError(f"no schema discovered for {data_source!r}.")
@@ -71,20 +71,19 @@ async def _build_chargeback_invoices(
     for col in (org_col, provider_col):
         if col and col in schema and col not in group_cols:
             group_cols.append(col)
-    df = cr.read_aggregated_cost(soe, dc, group_cols, cost_col, period_col, start, end, None, schema.get(period_col), top_n=200)
+    df = cr.read_aggregated_cost(
+        soe, dc, group_cols, cost_col, period_col, start, end, None, schema.get(period_col), top_n=200
+    )
     if df.is_empty():
         raise RuntimeError(f"no rows in the destination for {period_label}.")
 
-    # Aggregate to per-(cost_center, org, provider): billed_cost = sum(cost), row_count.
-    gb = [cc_col]
-    for col in (org_col, provider_col):
-        if col and col not in gb and col in df.columns:
-            gb.append(col)
+    # The frame is already per-(cost_center, org, provider[, allocation]) from SQL — shape it
+    # (cast/round the summed cost, keep SQL's row_count for the line-item descriptions).
+    gb = [c for c in group_cols if c in df.columns]
+    has_rc = "row_count" in df.columns
     agg = (
-        df.select([*gb, cost_col])
-        .with_columns(pl.col(cost_col).cast(pl.Float64, strict=False).alias("_cost"))
-        .group_by(gb)
-        .agg(pl.col("_cost").sum().round(2).alias("billed_cost"), pl.len().alias("row_count"))
+        df.select([*gb, cost_col] + (["row_count"] if has_rc else []))
+        .with_columns(pl.col(cost_col).cast(pl.Float64, strict=False).round(2).alias("billed_cost"))
         .sort("billed_cost", descending=True)
     )
 
@@ -99,6 +98,7 @@ async def _build_chargeback_invoices(
         provider = r.get(provider_col) if provider_col in gb else None
         provider = provider if provider is not None else "(unknown provider)"
         billed = float(r["billed_cost"] or 0)
+        records = int(r.get("row_count") or 0) if has_rc else 0
         inv = by_cc.setdefault(
             cc,
             {
@@ -117,7 +117,7 @@ async def _build_chargeback_invoices(
         inv["line_items"].append(
             {
                 "provider": provider,
-                "description": f"{provider} ({int(r['row_count'] or 0):,} charge records)",
+                "description": f"{provider} ({records:,} charge records)",
                 "billed_cost": billed,
             }
         )
@@ -147,7 +147,7 @@ def register(mcp: FastMCP, client, soe) -> None:
         only for the configured ERP.
         """
         try:
-            env_id = _resolve_env_id(soe, environment_id)
+            env_id = cm.resolve_env_id(soe, environment_id)
         except RuntimeError as exc:
             return str(exc)
         cfg = CHARGEBACK_POLICY["erp_integration"]
@@ -210,11 +210,10 @@ def register(mcp: FastMCP, client, soe) -> None:
             environment_id: Scope.
         """
         try:
-            _resolve_env_id(soe, environment_id)
+            cm.resolve_env_id(soe, environment_id)
         except RuntimeError as exc:
             return str(exc)
-        since_days = max(1, min(since_days, 365))
-        start, end, computed_label = _resolve_period(period, since_days)
+        start, end, computed_label = cm.resolve_window(period, since_days)
         if period_label is None:
             period_label = computed_label
         if materiality_threshold is None:
@@ -310,7 +309,7 @@ def register(mcp: FastMCP, client, soe) -> None:
             environment_id: Scope.
         """
         try:
-            env_id = _resolve_env_id(soe, environment_id)
+            env_id = cm.resolve_env_id(soe, environment_id)
         except RuntimeError as exc:
             return str(exc)
         if erp_system not in SUPPORTED_ERPS:
@@ -318,7 +317,7 @@ def register(mcp: FastMCP, client, soe) -> None:
         if materiality_threshold is None:
             materiality_threshold = get_chargeback_settings().materiality_threshold_usd
 
-        start, end, period_label = _resolve_period(period, since_days=30)
+        start, end, period_label = cm.resolve_window(period, 30)
         try:
             invoices, materiality = await _build_chargeback_invoices(
                 soe,
@@ -457,6 +456,6 @@ def register(mcp: FastMCP, client, soe) -> None:
 
 def _resolve_quiet(soe, environment_id: str | None) -> str:
     try:
-        return _resolve_env_id(soe, environment_id)
+        return cm.resolve_env_id(soe, environment_id)
     except RuntimeError:
         return "?"

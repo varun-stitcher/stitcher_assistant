@@ -2,10 +2,11 @@
 ``chargeback_provider_lineage``.
 
 Read a FOCUS data-lake **destination** (what Stitcher has written) via the SOE focus-query SQL
-path (``cost_reader.read_destination_dataframe`` → ``_run_focus_query``) and aggregate in polars.
-Chargeback only reads **destinations** — never source datasources — so the column defaults are
-FOCUS-normalized (``BilledCost`` / ``ChargePeriodStart`` / ``x_CostCenter`` / …). Omit
-``data_source`` to auto-resolve the environment's single FOCUS data lake.
+path (``cost_reader.read_aggregated_cost`` → ``_run_focus_query`` — the GROUP BY/SUM is pushed
+into the database) and shape/render with the shared ``common`` helpers. Chargeback only reads
+**destinations** — never source datasources — so the column defaults are FOCUS-normalized
+(``BilledCost`` / ``ChargePeriodStart`` / ``x_CostCenter`` / …). Omit ``data_source`` to
+auto-resolve the environment's single FOCUS data lake.
 
 Allocation lineage (direct / allocation-in / allocation-out) is only computed when the
 destination exposes ``x_AllocationStatusSource``/``Destination``. Period resolution, materiality
@@ -17,31 +18,10 @@ from __future__ import annotations
 import polars as pl
 from fastmcp import FastMCP
 
+from . import common as cm
 from . import cost_reader as cr
 from . import formatting as fmt
-from .period import resolve_period
-from .schema_tools import _resolve_env_id
 from .settings import CC_NAMES, get_chargeback_settings
-
-
-def _project_cost_center_name(cc: str) -> str:
-    """Human name for a cost-center key (registry lookup, else the raw key)."""
-    return CC_NAMES.get(cc, cc)
-
-
-def _no_cost_center_refusal(tool: str, schema: dict) -> str:
-    return (
-        f"ERR ({tool}): could not identify a cost-center column in the datasource. "
-        f"Columns: {', '.join(sorted(schema))}. Call discover_cost_schema, then pass "
-        f"cost_center_column explicitly (e.g. 'x_CostCenter')."
-    )
-
-
-def _no_cost_column_refusal(tool: str, schema: dict) -> str:
-    return (
-        f"ERR ({tool}): could not identify a cost column in the datasource. "
-        f"Columns: {', '.join(sorted(schema))}. Pass cost_column explicitly."
-    )
 
 
 def _rollup_cost_center(
@@ -51,11 +31,8 @@ def _rollup_cost_center(
     org_col: str | None,
     provider_col: str | None,
     alloc: tuple[str | None, str | None],
-    start,
-    end,
-    period_label: str,
 ) -> list[dict]:
-    """Aggregate the (already period-filtered) frame into per-(cost_center, provider) rows with
+    """Aggregate the SQL-aggregated frame into per-(cost_center, org, provider) rows with
     direct / allocation-in / allocation-out buckets (allocation only when the columns exist)."""
     alloc_src, alloc_dst = alloc
     if not cc_col:
@@ -66,10 +43,9 @@ def _rollup_cost_center(
             gb.append(col)
 
     cost = pl.col(cost_col).cast(pl.Float64, strict=False)
-    select_cols = [*gb, cost_col]
-    if alloc_src is not None and alloc_dst is not None and alloc_src in df.columns and alloc_dst in df.columns:
-        select_cols += [alloc_src, alloc_dst]
-    if alloc_src is not None and alloc_dst is not None and alloc_src in df.columns and alloc_dst in df.columns:
+    has_alloc = bool(alloc_src and alloc_dst and alloc_src in df.columns and alloc_dst in df.columns)
+    select_cols = [*gb, cost_col] + ([alloc_src, alloc_dst] if has_alloc else [])
+    if has_alloc:
         src, dst = pl.col(alloc_src), pl.col(alloc_dst)
         aggs = [
             pl.when(src.is_null() & dst.is_null() & (cost > 0))
@@ -102,9 +78,8 @@ def _rollup_cost_center(
         org = org if org is not None else "(unallocated)"
         provider = r.get(provider_col) if provider_col else None
         provider = provider if provider is not None else "(unknown provider)"
-        key = (cc, org, provider)
         bucket = out.setdefault(
-            key,
+            (cc, org, provider),
             {
                 "cost_center": cc,
                 "organization": org,
@@ -118,6 +93,59 @@ def _rollup_cost_center(
         bucket["allocation_in"] = round(bucket["allocation_in"] + float(r["allocation_in"] or 0), 2)
         bucket["allocation_out"] = round(bucket["allocation_out"] + float(r["allocation_out"] or 0), 2)
     return list(out.values())
+
+
+async def _read_cc_frame(
+    soe,
+    tool: str,
+    data_source: str,
+    environment_id: str | None,
+    *,
+    cost_column: str | None,
+    period_column: str | None,
+    cost_center_column: str | None,
+    org_column: str | None,
+    provider_column: str | None = None,
+    cost_center: str | None = None,
+    since_days: int = 30,
+    period: str | None = None,
+):
+    """Shared read for the two cost-center tools: prelude → classification → group columns → SQL
+    aggregation (with allocation columns when present). Returns
+    ``(dc, schema, cost_col, df, period_label, cols, alloc, has_alloc)`` where ``cols`` is
+    ``(cc_col, org_col, provider_col)``; raises :class:`cm.ToolRefusal` on every refusal boundary."""
+    dc, schema, cost_col = cm.prep_read(soe, tool, data_source, environment_id, cost_column)
+    classification = await cr.classify_org_cost_center(schema)
+    cc_col = await cr.resolve_cost_center_column(schema, cost_center_column, classification)
+    if not cc_col:
+        raise cm.ToolRefusal(cm.refusal(tool, "cost-center", schema, "cost_center_column"))
+    org_col = await cr.resolve_org_column(schema, org_column, classification) or cc_col
+    provider_col = cr.resolve_provider_column(schema, provider_column)
+    alloc_src, alloc_dst = cr.resolve_allocation_columns(schema)
+    period_col = cr.resolve_period_column(schema, period_column)
+    start, end, period_label = cm.resolve_window(period, since_days)
+
+    group_cols = [cc_col]
+    for col in (org_col, provider_col):
+        if col and col in schema and col not in group_cols:
+            group_cols.append(col)
+    filters = {cc_col: cost_center} if cost_center is not None else None
+    df = cr.read_aggregated_cost(
+        soe,
+        dc,
+        group_cols,
+        cost_col,
+        period_col,
+        start,
+        end,
+        filters,
+        schema.get(period_col),
+        allocation_src=alloc_src,
+        allocation_dst=alloc_dst,
+        top_n=200,
+    )
+    has_alloc = bool(alloc_src and alloc_dst)
+    return dc, schema, cost_col, df, period_label, (cc_col, org_col, provider_col), (alloc_src, alloc_dst), has_alloc
 
 
 def register(mcp: FastMCP, client, soe) -> None:
@@ -148,60 +176,36 @@ def register(mcp: FastMCP, client, soe) -> None:
             billing_account_column: Override the account/project dimension column.
             environment_id: Scope.
         """
-        try:
-            _resolve_env_id(soe, environment_id)
-        except RuntimeError as exc:
-            return str(exc)
         tool = "chargeback_by_billing_account"
         try:
-            dc = cr.load_data_connection(soe, data_source)
-        except Exception as e:  # noqa: BLE001
-            return f"ERR ({tool}): could not load destination {data_source!r}: {str(e)[:250]}"
-        schema = cr.read_cost_schema(soe, dc)
-        if not schema:
-            return f"ERR ({tool}): no schema discovered for destination {data_source!r}."
-        cost_col = cr.resolve_cost_column(schema, cost_column)
-        if not cost_col:
-            return _no_cost_column_refusal(tool, schema)
+            dc, schema, cost_col = cm.prep_read(soe, tool, data_source, environment_id, cost_column)
+        except cm.ToolRefusal as exc:
+            return str(exc)
         ba_col = cr.resolve_billing_account_column(schema, billing_account_column)
         if not ba_col:
-            return (
-                f"ERR ({tool}): could not identify a billing-account column. Columns: "
-                f"{', '.join(sorted(schema))}. Pass billing_account_column explicitly."
-            )
+            return cm.refusal(tool, "billing-account", schema, "billing_account_column")
         period_col = cr.resolve_period_column(schema, period_column)
-        top_n = max(1, min(top_n, 200))
-        since_days = max(1, min(since_days, 365))
-        start, end, period_label = resolve_period(period, since_days)
+        start, end, period_label = cm.resolve_window(period, since_days)
 
         try:
             df = cr.read_aggregated_cost(
-                soe, dc, [ba_col], cost_col, period_col, start, end, None, schema.get(period_col), top_n=top_n
+                soe, dc, [ba_col], cost_col, period_col, start, end, None, schema.get(period_col), top_n=200
             )
         except Exception as e:  # noqa: BLE001
             return f"ERR ({tool}): could not read destination: {str(e)[:300]}"
         if df.is_empty():
             return f"No rows in the destination for {period_label}."
 
-        agg = cr.aggregate_cost(df, [ba_col], cost_col, top_n)
-        total = float(df.select(pl.col(cost_col).cast(pl.Float64, strict=False).sum()).item() or 0.0)
-
-        lines = [
-            f"# Chargeback by {ba_col} — {period_label}",
-            f"source: `{getattr(dc, 'name', data_source)}`  ·  {df.height} charge records in window",
-            "",
-            "| Account / Project | Cost | Rows | % Share |",
-            "|---|---|---:|---:|",
-        ]
-        for r in agg.iter_rows(named=True):
-            dim = r.get(ba_col)
-            dim_s = "" if dim is None else str(dim)
-            cost = float(r.get("cost") or 0.0)
-            share = (cost / total * 100.0) if total else 0.0
-            lines.append(f"| {dim_s} | {fmt.fmt_money(cost)} | {r.get('row_count', 0)} | {share:.1f}% |")
-        lines.append("")
-        lines.append(f"**Total: {fmt.fmt_money(total)}** across {df.height} charge records.")
-        return "\n".join(lines)
+        rows, total, records = cm.cost_summary(df, [ba_col], cost_col, max(1, min(top_n, 200)))
+        return cm.share_table(
+            f"Chargeback by {ba_col}",
+            getattr(dc, "name", data_source),
+            records,
+            period_label,
+            [ba_col],
+            total,
+            rows,
+        )
 
     @mcp.tool
     async def chargeback_by_cost_center(
@@ -217,83 +221,56 @@ def register(mcp: FastMCP, client, soe) -> None:
         environment_id: str | None = None,
     ) -> str:
         """Run the monthly cloud-cost chargeback / showback report — allocate cost across cost
-        centers and return a rendered markdown table. PRIMARY entry point for "run chargeback for
-        <month>", "monthly chargeback", "cost-center chargeback", "showback".
+                centers and return a rendered markdown table. PRIMARY entry point for "run chargeback for
+                <month>", "monthly chargeback", "cost-center chargeback", "showback".
 
-        Reads a FOCUS data-lake **destination** (what Stitcher has written) via the SOE focus-query
-        SQL path. Groups by a cost-center column (default ``x_CostCenter``) and, when the
-destination exposes ``x_AllocationStatusSource``/``Destination``, decomposes each row into
-direct / allocation-in / allocation-out. Sub-materiality cost centers roll into a "Miscellaneous
-        (below materiality)" row so totals tie out.
+                Reads a FOCUS data-lake **destination** (what Stitcher has written) via the SOE focus-query
+                SQL path. Groups by a cost-center column (default ``x_CostCenter``) and, when the
+        destination exposes ``x_AllocationStatusSource``/``Destination``, decomposes each row into
+        direct / allocation-in / allocation-out. Sub-materiality cost centers roll into a "Miscellaneous
+                (below materiality)" row so totals tie out.
 
-        Args:
-            data_source: Name or id of the **destination** (a FOCUS data-lake export connection).
-                Omit to auto-resolve the environment's single FOCUS data lake.
-            period: ``YYYY-MM`` or "last_month" — snaps to month boundaries.
-            since_days: Rolling-window fallback when ``period`` is omitted.
-            include_unallocated: Hide the orphan (untagged) bucket when False. Default True.
-            materiality_threshold: Roll cost centers below this USD amount into one "Miscellaneous"
-                row. Defaults to CHARGEBACK_MATERIALITY_THRESHOLD_USD. Pass 0 to disable.
-            cost_center_column / org_column: Override discovered cost-center / org columns.
-            cost_column / period_column: Override cost / period columns.
-            environment_id: Scope.
+                Args:
+                    data_source: Name or id of the **destination** (a FOCUS data-lake export connection).
+                        Omit to auto-resolve the environment's single FOCUS data lake.
+                    period: ``YYYY-MM`` or "last_month" — snaps to month boundaries.
+                    since_days: Rolling-window fallback when ``period`` is omitted.
+                    include_unallocated: Hide the orphan (untagged) bucket when False. Default True.
+                    materiality_threshold: Roll cost centers below this USD amount into one "Miscellaneous"
+                        row. Defaults to CHARGEBACK_MATERIALITY_THRESHOLD_USD. Pass 0 to disable.
+                    cost_center_column / org_column: Override discovered cost-center / org columns.
+                    cost_column / period_column: Override cost / period columns.
+                    environment_id: Scope.
         """
-        try:
-            _resolve_env_id(soe, environment_id)
-        except RuntimeError as exc:
-            return str(exc)
         tool = "chargeback_by_cost_center"
         try:
-            dc = cr.load_data_connection(soe, data_source)
-        except Exception as e:  # noqa: BLE001
-            return f"ERR ({tool}): could not load destination {data_source!r}: {str(e)[:250]}"
-        schema = cr.read_cost_schema(soe, dc)
-        if not schema:
-            return f"ERR ({tool}): no schema discovered for destination {data_source!r}."
-        cost_col = cr.resolve_cost_column(schema, cost_column)
-        if not cost_col:
-            return _no_cost_column_refusal(tool, schema)
-        classification = await cr.classify_org_cost_center(schema)
-        cc_col = await cr.resolve_cost_center_column(schema, cost_center_column, classification)
-        if not cc_col:
-            return _no_cost_center_refusal(tool, schema)
-        org_col = await cr.resolve_org_column(schema, org_column, classification) or cc_col
-        alloc_src, alloc_dst = cr.resolve_allocation_columns(schema)
-        has_alloc = bool(alloc_src and alloc_dst)
-        period_col = cr.resolve_period_column(schema, period_column)
-        since_days = max(1, min(since_days, 365))
-        start, end, period_label = resolve_period(period, since_days)
+            (
+                dc,
+                _schema,
+                cost_col,
+                df,
+                period_label,
+                (cc_col, org_col, provider_col),
+                (alloc_src, alloc_dst),
+                has_alloc,
+            ) = await _read_cc_frame(
+                soe,
+                tool,
+                data_source,
+                environment_id,
+                cost_column=cost_column,
+                period_column=period_column,
+                cost_center_column=cost_center_column,
+                org_column=org_column,
+            )
+        except cm.ToolRefusal as exc:
+            return str(exc)
+        if df.is_empty():
+            return f"No rows in the destination for {period_label}."
         if materiality_threshold is None:
             materiality_threshold = get_chargeback_settings().materiality_threshold_usd
 
-        provider_col = cr.resolve_provider_column(schema)
-        group_cols = [cc_col]
-        for col in (org_col, provider_col):
-            if col and col in schema and col not in group_cols:
-                group_cols.append(col)
-        try:
-            df = cr.read_aggregated_cost(
-                soe,
-                dc,
-                group_cols,
-                cost_col,
-                period_col,
-                start,
-                end,
-                None,
-                schema.get(period_col),
-                allocation_src=alloc_src,
-                allocation_dst=alloc_dst,
-                top_n=200,
-            )
-        except Exception as e:  # noqa: BLE001
-            return f"ERR ({tool}): could not read destination: {str(e)[:300]}"
-        if df.is_empty():
-            return f"No rows in the destination for {period_label}."
-
-        rows = _rollup_cost_center(
-            df, cost_col, cc_col, org_col, provider_col, (alloc_src, alloc_dst), start, end, period_label
-        )
+        rows = _rollup_cost_center(df, cost_col, cc_col, org_col, provider_col, (alloc_src, alloc_dst))
 
         # Roll (cost_center, org, provider) → per-cost-center, keeping per-provider notes.
         rollup: dict[str, dict] = {}
@@ -303,7 +280,7 @@ direct / allocation-in / allocation-out. Sub-materiality cost centers roll into 
                 cc,
                 {
                     "cost_center": cc,
-                    "cost_center_name": _project_cost_center_name(cc),
+                    "cost_center_name": CC_NAMES.get(cc, cc),
                     "organization": r["organization"],
                     "direct_cost": 0.0,
                     "allocation_in": 0.0,
@@ -315,14 +292,7 @@ direct / allocation-in / allocation-out. Sub-materiality cost centers roll into 
             bucket["direct_cost"] += r["direct_cost"]
             bucket["allocation_in"] += r["allocation_in"]
             bucket["allocation_out"] += r["allocation_out"]
-            bucket["providers"].append(
-                {
-                    "provider": r["provider"],
-                    "direct_cost": r["direct_cost"],
-                    "allocation_in": r["allocation_in"],
-                    "allocation_out": r["allocation_out"],
-                }
-            )
+            bucket["providers"].append(r)
         for bucket in rollup.values():
             bucket["direct_cost"] = round(bucket["direct_cost"], 2)
             bucket["allocation_in"] = round(bucket["allocation_in"], 2)
@@ -336,31 +306,25 @@ direct / allocation-in / allocation-out. Sub-materiality cost centers roll into 
         if not include_unallocated:
             rows_sorted = [r for r in rows_sorted if r["cost_center"] != "(unallocated)"]
 
-        # Materiality rollup.
+        # Materiality rollup: keep ≥ threshold, combine the rest into one Miscellaneous row.
         kept = [r for r in rows_sorted if abs(r["net_chargeback"]) >= materiality_threshold]
-        filtered = [r for r in rows_sorted if r not in kept]
-        if filtered:
+        below = [r for r in rows_sorted if abs(r["net_chargeback"]) < materiality_threshold]
+        if below:
             kept.append(
                 {
                     "cost_center": "Miscellaneous (below materiality)",
                     "cost_center_name": "Miscellaneous (below materiality)",
                     "organization": "(various)",
-                    "direct_cost": round(sum(r["direct_cost"] for r in filtered), 2),
-                    "allocation_in": round(sum(r["allocation_in"] for r in filtered), 2),
-                    "allocation_out": round(sum(r["allocation_out"] for r in filtered), 2),
-                    "net_chargeback": round(sum(r["net_chargeback"] for r in filtered), 2),
-                    "providers": [],
-                    "notes": f"{len(filtered)} cost centers combined (threshold ${materiality_threshold:.2f})",
+                    "direct_cost": round(sum(r["direct_cost"] for r in below), 2),
+                    "allocation_in": round(sum(r["allocation_in"] for r in below), 2),
+                    "allocation_out": round(sum(r["allocation_out"] for r in below), 2),
+                    "net_chargeback": round(sum(r["net_chargeback"] for r in below), 2),
+                    "notes": f"{len(below)} cost centers combined (threshold ${materiality_threshold:.2f})",
                 }
             )
-        rows_sorted = kept
 
-        header = (
-            "| Cost Center | Org | Direct | Allocation in | Allocation out | Net Chargeback | Notes |\n"
-            "|---|---|---:|---:|---:|---:|---|"
-        )
         body = []
-        for row in rows_sorted:
+        for row in kept:
             name = row["cost_center"]
             if row["cost_center_name"] and row["cost_center_name"] != name:
                 name = f"{name} ({row['cost_center_name']})"
@@ -380,26 +344,24 @@ direct / allocation-in / allocation-out. Sub-materiality cost centers roll into 
                 + " |"
             )
         totals = {
-            "direct": round(sum(r["direct_cost"] for r in rows_sorted), 2),
-            "in": round(sum(r["allocation_in"] for r in rows_sorted), 2),
-            "out": round(sum(r["allocation_out"] for r in rows_sorted), 2),
-            "net": round(sum(r["net_chargeback"] for r in rows_sorted), 2),
+            k: round(sum(r[k] for r in kept), 2)
+            for k in ("direct_cost", "allocation_in", "allocation_out", "net_chargeback")
         }
         body.append(
-            "| **TOTAL** |  | "
-            f"**{fmt.fmt_money(totals['direct'])}** | "
-            f"**{fmt.fmt_money(totals['in'])}** | "
-            f"**{fmt.fmt_money(totals['out'])}** | "
-            f"**{fmt.fmt_money(totals['net'])}** |  |"
+            f"| **TOTAL** |  | **{fmt.fmt_money(totals['direct_cost'])}** | "
+            f"**{fmt.fmt_money(totals['allocation_in'])}** | **{fmt.fmt_money(totals['allocation_out'])}** | "
+            f"**{fmt.fmt_money(totals['net_chargeback'])}** |  |"
         )
 
+        records = int(df.select(pl.col("row_count").sum()).item() or 0) if "row_count" in df.columns else df.height
         return "\n".join(
             [
                 f"# Chargeback by cost center — {period_label}",
-                f"source: `{getattr(dc, 'name', data_source)}`  ·  {df.height} charge records in window"
+                f"source: `{getattr(dc, 'name', data_source)}`  ·  {records:,} charge records in window"
                 + ("" if has_alloc else "  ·  _no allocation columns — direct cost only_"),
                 "",
-                header + "\n" + "\n".join(body),
+                "| Cost Center | Org | Direct | Allocation in | Allocation out | Net Chargeback | Notes |\n"
+                "|---|---|---:|---:|---:|---:|---|\n" + "\n".join(body),
                 "",
                 "Render the table VERBATIM — do NOT collapse the lineage columns. Negative numbers "
                 "are credits (in parentheses). Summarize the TOTAL row in 1–2 sentences.",
@@ -440,100 +402,66 @@ direct / allocation-in / allocation-out. Sub-materiality cost centers roll into 
             cost_column / period_column: Override cost / period columns.
             environment_id: Scope.
         """
-        try:
-            _resolve_env_id(soe, environment_id)
-        except RuntimeError as exc:
-            return str(exc)
         tool = "chargeback_provider_lineage"
         try:
-            dc = cr.load_data_connection(soe, data_source)
-        except Exception as e:  # noqa: BLE001
-            return f"ERR ({tool}): could not load destination {data_source!r}: {str(e)[:250]}"
-        schema = cr.read_cost_schema(soe, dc)
-        if not schema:
-            return f"ERR ({tool}): no schema discovered for destination {data_source!r}."
-        cost_col = cr.resolve_cost_column(schema, cost_column)
-        if not cost_col:
-            return _no_cost_column_refusal(tool, schema)
-        classification = await cr.classify_org_cost_center(schema)
-        cc_col = await cr.resolve_cost_center_column(schema, cost_center_column, classification)
-        if not cc_col:
-            return _no_cost_center_refusal(tool, schema)
-        org_col = await cr.resolve_org_column(schema, org_column, classification) or cc_col
-        provider_col = cr.resolve_provider_column(schema, provider_column)
-        alloc_src, alloc_dst = cr.resolve_allocation_columns(schema)
-        has_alloc = bool(alloc_src and alloc_dst)
-        period_col = cr.resolve_period_column(schema, period_column)
-        since_days = max(1, min(since_days, 365))
-        start, end, period_label = resolve_period(period, since_days)
-
-        group_cols = [cc_col]
-        for col in (org_col, provider_col):
-            if col and col in schema and col not in group_cols:
-                group_cols.append(col)
-        filters = {cc_col: cost_center} if cost_center is not None else None
-        try:
-            df = cr.read_aggregated_cost(
-                soe,
-                dc,
-                group_cols,
-                cost_col,
-                period_col,
-                start,
-                end,
-                filters,
-                schema.get(period_col),
-                allocation_src=alloc_src,
-                allocation_dst=alloc_dst,
-                top_n=200,
+            dc, _schema, cost_col, df, period_label, (cc_col, org_col, provider_col), _alloc, has_alloc = (
+                await _read_cc_frame(
+                    soe,
+                    tool,
+                    data_source,
+                    environment_id,
+                    cost_column=cost_column,
+                    period_column=period_column,
+                    cost_center_column=cost_center_column,
+                    org_column=org_column,
+                    provider_column=provider_column,
+                    cost_center=cost_center,
+                )
             )
-        except Exception as e:  # noqa: BLE001
-            return f"ERR ({tool}): could not read destination: {str(e)[:300]}"
-        # SQL already applied the period + cost_center filters; keep polars filter as a no-op safety net.
-        if cost_center is not None and cc_col in df.columns:
-            df = df.filter(pl.col(cc_col) == cost_center)
+        except cm.ToolRefusal as exc:
+            return str(exc)
         if df.is_empty():
             return f"No rows in the destination for {period_label}."
 
-        rows = _rollup_cost_center(
-            df, cost_col, cc_col, org_col, provider_col, (alloc_src, alloc_dst), start, end, period_label
-        )
+        rows = _rollup_cost_center(df, cost_col, cc_col, org_col, provider_col, _alloc)
         for r in rows:
             r["net_chargeback"] = round(r["direct_cost"] + r["allocation_in"] + r["allocation_out"], 2)
         rows.sort(key=lambda r: -abs(r["net_chargeback"]))
 
-        header = "| Cost Center | Org | Provider | Direct | Allocation in | Allocation out | Net |"
-        header += "" if has_alloc else " Direct Cost |"
+        def _cells(r: dict) -> list[str]:
+            cells = [r["cost_center"], r["organization"], r["provider"], fmt.fmt_money(r["direct_cost"])]
+            if has_alloc:
+                cells += [
+                    fmt.fmt_money(r["allocation_in"]),
+                    fmt.fmt_money(r["allocation_out"]),
+                    fmt.fmt_money(r["net_chargeback"]),
+                ]
+            return cells
+
+        header = (
+            (
+                "| Cost Center | Org | Provider | Direct | Allocation in | Allocation out | Net |\n"
+                "|---|---|---:|---:|---:|---:|---:|"
+            )
+            if has_alloc
+            else ("| Cost Center | Org | Provider | Direct Cost |\n|---|---|---:|---:|")
+        )
         lines = [
             f"# Chargeback provider lineage — {period_label}"
             + (f"  (cost center: {cost_center})" if cost_center else ""),
-            f"source: `{getattr(dc, 'name', data_source)}`  ·  {df.height} charge records in window",
+            f"source: `{getattr(dc, 'name', data_source)}`  ·  {df.height:,} groups in window",
+            "",
+            header,
+        ]
+        lines.extend("| " + " | ".join(_cells(r)) + " |" for r in rows)
+        lines += [
             "",
             (
-                (header + "\n" + "|---|---|---:|---:|---:|---:|---:|")
-                if has_alloc
-                else ("| Cost Center | Org | Provider | Direct Cost |\n|---|---|---:|---:|")
-            ),
-        ]
-        for r in rows:
-            if has_alloc:
-                lines.append(
-                    f"| {r['cost_center']} | {r['organization']} | {r['provider']} | "
-                    f"{fmt.fmt_money(r['direct_cost'])} | {fmt.fmt_money(r['allocation_in'])} | "
-                    f"{fmt.fmt_money(r['allocation_out'])} | {fmt.fmt_money(r['net_chargeback'])} |"
-                )
-            else:
-                lines.append(
-                    f"| {r['cost_center']} | {r['organization']} | {r['provider']} | "
-                    f"{fmt.fmt_money(r['direct_cost'])} |"
-                )
-        lines.append("")
-        if has_alloc:
-            lines.append(
                 "Legend: direct = provider invoices tagged to the CC; allocation in = shared "
                 "services consumed; allocation out = credit for being a shared platform "
                 "(negative, in parentheses). net = direct + in + out."
-            )
-        else:
-            lines.append("No x_Allocation* columns — direct cost per provider only.")
+                if has_alloc
+                else "No x_Allocation* columns — direct cost per provider only."
+            ),
+        ]
         return "\n".join(lines)

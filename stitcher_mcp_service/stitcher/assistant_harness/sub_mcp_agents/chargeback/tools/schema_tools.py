@@ -1,18 +1,17 @@
 """Cost schema discovery + business-column classification for the chargeback tools.
 
-Reads a FOCUS data-lake **destination**'s schema via the SOE **metadata operator**
-(``cost_reader.read_cost_schema`` — no data scan) and classifies its columns into
-business-context buckets (organization / cost_center / project / environment / allocation /
-provider / period / cost) by heuristic name patterns. Destinations are FOCUS-normalized, so the
-defaults (``x_*`` custom columns + ``BilledCost``/``ChargePeriodStart``) almost always apply.
-Shared by the report + invoice tools so every tool uses the same discovered column mapping, and
-it shows the assistant which columns map to which business dimension before running a report.
+Reads a FOCUS data-lake **destination**'s schema (``cost_reader.read_cost_schema`` — no data
+scan) and classifies its columns into business-context buckets (organization / cost_center /
+project / environment / allocation / provider / period / cost) by heuristic name patterns.
+Destinations are FOCUS-normalized, so the defaults (``x_*`` custom columns +
+``BilledCost``/``ChargePeriodStart``) almost always apply.
 """
 
 from __future__ import annotations
 
 from fastmcp import FastMCP
 
+from . import common as cm
 from . import cost_reader as cr
 
 # Heuristic name patterns for classifying columns into business-context buckets (matched
@@ -75,54 +74,6 @@ def pick_column(classified: dict[str, list[str]], category: str, override: str |
     return None
 
 
-def _resolve_env_id(soe, environment_id: str | None) -> str:
-    """Resolve the env to operate on; raises a clear error when unscoped."""
-    env_id = environment_id or soe.environment_id
-    if not env_id:
-        raise RuntimeError("ERR: no STITCHER_ENVIRONMENT_ID — chargeback tools are environment-scoped.")
-    return env_id
-
-
-async def resolve_business_columns(
-    soe,
-    data_source: str = "",
-    org_column: str | None = None,
-    cost_center_column: str | None = None,
-) -> tuple[dict[str, str | None], str | None]:
-    """Discover cost-column / period-column / org / cost-center / allocation columns from a cost
-    datasource's schema.
-
-    Returns ``(column_map, error)`` where ``column_map`` has keys ``cost_column``,
-    ``period_column``, ``organization``, ``cost_center``, ``allocation_source``,
-    ``allocation_destination``, ``schema``, and ``classification``. Callers can override
-    discovery with explicit ``org_column`` / ``cost_center_column``. Raises ``RuntimeError`` on
-    invalid input; returns ``({}, error)`` on schema-read failure.
-    """
-    try:
-        dc = cr.load_data_connection(soe, data_source)
-    except Exception as e:  # noqa: BLE001
-        return {}, f"could not load data source {data_source!r}: {str(e)[:250]}"
-    schema = cr.read_cost_schema(soe, dc)
-    if not schema:
-        return {}, f"no schema discovered for {data_source!r} — the connection may be unreachable."
-
-    classified = classify_columns(schema)
-    org_col = pick_column(classified, "organization", org_column)
-    cc_col = pick_column(classified, "cost_center", cost_center_column)
-    alloc_src, alloc_dst = cr.resolve_allocation_columns(schema)
-
-    return {
-        "cost_column": cr.resolve_cost_column(schema),
-        "period_column": cr.resolve_period_column(schema),
-        "organization": org_col,
-        "cost_center": cc_col,
-        "allocation_source": alloc_src,
-        "allocation_destination": alloc_dst,
-        "schema": schema,
-        "classification": classified,
-    }, None
-
-
 def register(mcp: FastMCP, client, soe) -> None:
     @mcp.tool
     async def list_chargeback_destinations(
@@ -139,7 +90,7 @@ def register(mcp: FastMCP, client, soe) -> None:
             environment_id: Scope.
         """
         try:
-            env_id = _resolve_env_id(soe, environment_id)
+            env_id = cm.resolve_env_id(soe, environment_id)
         except RuntimeError as exc:
             return str(exc)
         try:
@@ -158,14 +109,14 @@ def register(mcp: FastMCP, client, soe) -> None:
         lines.append("|---|---|---|---|")
         from stitcher.operation_executor.workflows.assistant_workflow.activities.focus_query import (
             _build_table_ref as _tref,
-            _conn_engine as _eng,
         )
+        from stitcher.operation_executor.workflows.assistant_workflow.activities.focus_query import _conn_engine as _eng
+
         for c in dests:
             eng = _eng(c) or "?"
             tbl = _tref(c, eng) if eng != "?" else ""
             lines.append(
-                f"| {getattr(c, 'name', '')} | {eng} | "
-                f"{getattr(c, 'dataset_name', '') or ''} | {tbl or ''} |"
+                f"| {getattr(c, 'name', '')} | {eng} | " f"{getattr(c, 'dataset_name', '') or ''} | {tbl or ''} |"
             )
         lines.append("")
         lines.append(
@@ -180,35 +131,31 @@ def register(mcp: FastMCP, client, soe) -> None:
         environment_id: str | None = None,
     ) -> str:
         """Discover a FOCUS data-lake **destination**'s schema and classify its columns by
-        business context.
+                business context.
 
-        Reads the schema via the SOE metadata operator (no data scan) and classifies every
-column
-        by likely business context (cost, period, organization, cost_center, project, provider,
-        environment, allocation). Returns a suggested column mapping for the chargeback tools.
+                Reads the schema via the SOE metadata operator (no data scan) and classifies every
+        column
+                by likely business context (cost, period, organization, cost_center, project, provider,
+                environment, allocation). Returns a suggested column mapping for the chargeback tools.
 
-        **Call this before chargeback_by_cost_center / query_focus_cost /
-generate_chargeback_invoices**
-        to confirm which columns map to which business dimensions in your destination. If the
-        classification is ambiguous (multiple candidates), pass the correct column explicitly on
-        the report tools.
+                **Call this before chargeback_by_cost_center / query_focus_cost /
+        generate_chargeback_invoices**
+                to confirm which columns map to which business dimensions in your destination. If the
+                classification is ambiguous (multiple candidates), pass the correct column explicitly on
+                the report tools.
 
-        Args:
-            data_source: Name or id of the **destination** (a FOCUS data-lake export connection).
-                Omit to auto-resolve the environment's single FOCUS data lake.
-            environment_id: Scope.
+                Args:
+                    data_source: Name or id of the **destination** (a FOCUS data-lake export connection).
+                        Omit to auto-resolve the environment's single FOCUS data lake.
+                    environment_id: Scope.
         """
         try:
-            env_id = _resolve_env_id(soe, environment_id)
-        except RuntimeError as exc:
+            dc, schema, _cost_col = cm.prep_read(
+                soe, "discover_cost_schema", data_source, environment_id, require_cost=False
+            )
+            env_id = cm.resolve_env_id(soe, environment_id)
+        except cm.ToolRefusal as exc:
             return str(exc)
-        try:
-            dc = cr.load_data_connection(soe, data_source)
-        except Exception as e:  # noqa: BLE001
-            return f"ERR (discover_cost_schema): could not load destination {data_source!r}: {str(e)[:250]}"
-        schema = cr.read_cost_schema(soe, dc)
-        if not schema:
-            return f"ERR (discover_cost_schema): no schema discovered for destination {data_source!r}."
 
         classified = classify_columns(schema)
         cost_col = cr.resolve_cost_column(schema)

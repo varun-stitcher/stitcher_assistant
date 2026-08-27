@@ -1,8 +1,7 @@
 """Shared formatting helpers for the chargeback report / invoice / query tools.
 
-Keeps money / bytes / table rendering in one place so every tool renders the same
-way (right-aligned money columns, negative-as-parentheses, bytes humanized). Ported
-from SPC's ``tools/chargeback.py`` (``_fmt_money`` / ``_format_bytes`` /
+Keeps money / table rendering in one place so every tool renders the same way (money cells,
+negative-as-parentheses). Ported from SPC's ``tools/chargeback.py`` (``_fmt_money`` /
 ``_provider_notes`` / ``_build_posted_summary_markdown``).
 """
 
@@ -17,16 +16,6 @@ def fmt_money(v: float | None) -> str:
     if v < 0:
         return f"(${abs(v):,.2f})"
     return f"${v:,.2f}"
-
-
-def format_bytes(num_bytes: int | None) -> str:
-    """Humanize a bytes count (B → EB)."""
-    n = float(num_bytes or 0)
-    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
-        if abs(n) < 1024:
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return f"{n:.2f} EB"
 
 
 def provider_notes(providers: list[dict]) -> str:
@@ -72,6 +61,5 @@ def build_posted_summary_markdown(invoices: list[dict], materiality: dict) -> st
 __all__ = [
     "build_posted_summary_markdown",
     "fmt_money",
-    "format_bytes",
     "provider_notes",
 ]

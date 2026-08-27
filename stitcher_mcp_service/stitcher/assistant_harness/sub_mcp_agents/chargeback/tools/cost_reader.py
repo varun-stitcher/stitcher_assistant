@@ -2,11 +2,9 @@
 
 Chargeback only ever reads **destinations** — the FOCUS-normalized tables Stitcher has *written*
 (the environment's BigQuery / Snowflake export destinations) — never arbitrary source datasources.
-A destination is a *queryable* data-lake: a DB export whose ``connection_parameters`` resolve to
-a real table reference. SOE already owns the canonical resolution + query machinery in
-``focus_query._resolve_focus_connection`` / ``_run_focus_query``; this module reuses it **as-is**
-(importing the activity's helpers directly — the plan's Step-1 spike confirmed that import is
-Temporal-free and works when launched from ``pi_coding_agent/`` where ``.env.local`` resolves):
+SOE owns the canonical resolution + query machinery in ``focus_query._resolve_focus_connection``
+/ ``_run_focus_query``; this module reuses it **as-is** (the import is Temporal-free and works
+when launched from ``pi_coding_agent/`` where ``.env.local`` resolves):
 
   - **Resolve a destination:** ``resolve_destination(soe, name_or_id)`` → load a specific
     destination connection by name/id via ``DataConnType.DESTINATIONS``, or auto-resolve the
@@ -14,14 +12,12 @@ Temporal-free and works when launched from ``pi_coding_agent/`` where ``.env.loc
     ``STITCHER_AI_DB_EXPORT_V1_0`` DB export, mirroring ``_resolve_focus_connection``).
   - **List destinations:** ``list_chargeback_destinations(soe)`` → the environment's queryable
     FOCUS destinations (the grounding surface — "what Stitcher has written").
-  - **Schema (cheap, no scan):** ``read_cost_schema(soe, dc)`` → columns + dtypes via the SOE
-    metadata operator (the same call ``discover_cost_schema`` uses to classify columns).
-  - **Data (SQL path):** ``read_destination_dataframe(soe, dc, columns, period_col, start, end,
-    filters, period_dtype)`` → builds a BigQuery-flavored ``SELECT … FROM {focus_table} WHERE …``
-    with ``@name`` query parameters (period window + equality filters pushed down so we never pull
-    the whole table), runs it via ``_run_focus_query`` (BigQuery ADC or Snowflake+Vault), and
-    returns the rows as an eager polars DataFrame. The report/invoice/query tools then aggregate
-    in polars (group_by + sum the cost column).
+  - **Schema (cheap, no scan):** ``read_cost_schema(soe, dc)`` → columns + dtypes via a
+    ``LIMIT 1`` probe through the same SQL path the data read uses.
+  - **Data (SQL path):** ``read_aggregated_cost(soe, dc, group_by_cols, cost_col, …)`` → pushes
+    the ``GROUP BY`` + ``SUM`` into BigQuery/Snowflake (period window + equality filters pushed
+    into the ``WHERE`` via ``@name`` parameters) so only ~group-count rows are pulled, never the
+    whole table. Callers shape/render the returned frame (``common.cost_summary``).
 
 Column mapping uses FOCUS defaults (``BilledCost`` / ``ChargePeriodStart`` / ``BillingAccountId`` /
 ``x_CostCenter`` …) — destinations are FOCUS-normalized, so the defaults almost always apply, but
@@ -31,9 +27,14 @@ is computed only when the destination exposes those columns.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from datetime import date
+from typing import Any
 
 import polars as pl
+
+from stitcher.pipeline.common.column_names.stitcher_column_names import StitcherColumnNames as _StitcherCol
+from stitcher.pipeline.common.focus_column_names import FocusColumnNames as _FocusCol
 
 # ── Column discovery — enum-backed FOCUS names ONLY (destinations are FOCUS-normalized) ──
 #
@@ -44,10 +45,6 @@ import polars as pl
 # cost-center live under the customer ``x_*`` namespace and are discovered by the LLM classifier
 # (see ``classify_org_cost_center``) — with a deterministic ``x_*`` default as the escape hatch.
 
-from stitcher.pipeline.common.focus_column_names import FocusColumnNames as _FocusCol
-from stitcher.pipeline.common.column_names.stitcher_column_names import (
-    StitcherColumnNames as _StitcherCol,
-)
 
 # cost(4) — the canonical FOCUS cost columns.
 _COST_CANDIDATES = [
@@ -114,14 +111,19 @@ _ALLOC_DST_CANDIDATES = [
 ]
 
 # Short aliases → candidate list, so group_by="service" / "billing_account" / "provider" /
-# "region" work without typing the full column name. A literal column name always wins. There is
-# deliberately no ``cost_center`` / ``organization`` / ``project`` alias — those dimensions are
-# LLM-discovered (and must be passed as a real column name or an explicit override).
+# "region" work without typing the full column name. A literal column name always wins.
+# ``cost_center`` / ``organization`` resolve via the DETERMINISTIC conventional x_* defaults only
+# (never the LLM — the ad-hoc query path stays cheap and reproducible); if the customer renamed
+# those columns, pass the real column name (``discover_cost_schema`` shows it).
 _ALIASES: dict[str, list[str]] = {
     "service": _SERVICE_CANDIDATES,
     "provider": _PROVIDER_CANDIDATES,
     "billing_account": _BILLING_ACCOUNT_CANDIDATES,
     "region": _REGION_CANDIDATES,
+    "cost_center": _COST_CENTER_X_DEFAULTS,
+    "cost_centre": _COST_CENTER_X_DEFAULTS,
+    "organization": _ORG_X_DEFAULTS,
+    "org": _ORG_X_DEFAULTS,
 }
 
 
@@ -153,13 +155,14 @@ def _import_focus_query():
     )
     from stitcher.pipeline.common.dataset_type import SupportedDatasets
 
-    return _resolve_focus_connection, _run_focus_query, _conn_engine, _build_table_ref, _is_focus_destination, SupportedDatasets
-
-
-def _queryable_destinations(dcu, destinations):
-    """Narrow to destinations that resolve to a real queryable table ref (BigQuery/Snowflake)."""
-    _resolve, _run, _engine, _table_ref, _is_focus, _ = _import_focus_query()
-    return [c for c in destinations if _engine(c) is not None and _table_ref(c, _engine(c)) is not None]
+    return (
+        _resolve_focus_connection,
+        _run_focus_query,
+        _conn_engine,
+        _build_table_ref,
+        _is_focus_destination,
+        SupportedDatasets,
+    )
 
 
 def list_chargeback_destinations(soe):
@@ -177,11 +180,12 @@ def list_chargeback_destinations(soe):
     if not queryable:
         return []
     db_export = [
-        c for c in queryable
+        c
+        for c in queryable
         if str(getattr(c, "dataset_name", "") or "") == SupportedDatasets.STITCHER_AI_DB_EXPORT_V1_0.value
     ]
     focus_hinted = [c for c in queryable if _is_focus(c)]
-    ordered = (db_export or focus_hinted or queryable)
+    ordered = db_export or focus_hinted or queryable
     # Stable, deterministic order by name (ties broken by id).
     return sorted(ordered, key=lambda c: (str(getattr(c, "name", "") or ""), str(getattr(c, "id", "") or "")))
 
@@ -211,14 +215,6 @@ def resolve_destination(soe, name_or_id: str = ""):
             "destination and try again."
         )
     return conn
-
-
-def load_data_connection(soe, name_or_id: str = ""):
-    """Load a chargeback **destination** by name/id, or auto-resolve the FOCUS lake when omitted.
-
-    (Name kept for compatibility with the tool layer + tests; this now resolves DESTINATIONS, not
-    source datasources — chargeback reads what Stitcher has written.)"""
-    return resolve_destination(soe, name_or_id)
 
 
 def read_cost_schema(soe, dc) -> dict[str, str]:
@@ -273,9 +269,7 @@ def _focus_where(engine: str, period_col, start, end, filters, period_dtype) -> 
     if period_col and start is not None and end is not None:
         pcol = _quote(engine, period_col)
         if is_date_period:
-            where_parts.append(
-                f"CAST({pcol} AS DATETIME) >= @p_start AND CAST({pcol} AS DATETIME) < @p_end"
-            )
+            where_parts.append(f"CAST({pcol} AS DATETIME) >= @p_start AND CAST({pcol} AS DATETIME) < @p_end")
             params.append({"name": "p_start", "type": "DATETIME", "value": f"{start.isoformat()}T00:00:00"})
             params.append({"name": "p_end", "type": "DATETIME", "value": f"{end.isoformat()}T00:00:00"})
         else:  # string period (e.g. invoice.month "202506"): match YYYY-MM by prefix
@@ -295,70 +289,6 @@ def _focus_where(engine: str, period_col, start, end, filters, period_dtype) -> 
     return where_sql, params
 
 
-def read_destination_dataframe(
-    soe,
-    dc,
-    columns: list[str],
-    period_col: str | None = None,
-    start: date | None = None,
-    end: date | None = None,
-    filters: dict | None = None,
-    period_dtype: str | None = None,
-) -> pl.DataFrame:
-    """Read a FOCUS data-lake **destination** into an eager polars DataFrame via the SOE
-    focus-query SQL path (the canonical "read what Stitcher wrote" path).
-
-    Builds a BigQuery-flavored ``SELECT <columns> FROM {focus_table} WHERE <period> AND <filters>``
-    with ``@name`` query parameters (period window + equality filters pushed down into the SQL so
-    the whole table is never pulled), runs it via SOE's ``_run_focus_query`` (BigQuery ADC or
-    Snowflake+Vault — transpiled by sqlglot), and materializes the rows as a polars DataFrame.
-
-    Args:
-      dc: the destination ``DataConnectionResponse`` (from ``resolve_destination``).
-      columns: the columns to SELECT (the ones the caller will aggregate on).
-      period_col: period column for the WHERE window (datetime/date, or a string ``invoice.month``
-        — selected via ``period_dtype``). When ``None`` no period filter is applied.
-      start / end: half-open ``[start, end)`` window.
-      filters: optional ``{column: value}`` equality filters pushed into the WHERE.
-      period_dtype: the schema dtype of ``period_col`` (``"Datetime"`` / ``"Date"`` → date
-        comparison; anything else → string ``YYYY-MM`` prefix match).
-
-    Raises ``RuntimeError`` with the engine's error if the query fails — never a fabricated frame.
-    """
-    import asyncio  # noqa: F401  (kept for future to_thread wrap; _run_focus_query is sync)
-
-    _resolve, _run, _engine, _table_ref, _is_focus, _ = _import_focus_query()
-    if not columns:
-        raise RuntimeError("read_destination_dataframe: at least one column is required.")
-    engine = _engine(dc)
-    table_ref = _table_ref(dc, engine) if engine else None
-    if not engine or not table_ref:
-        raise RuntimeError(
-            f"destination {getattr(dc, 'name', '?')!r} is not a queryable FOCUS data lake "
-            "(BigQuery/Snowflake DB export with a resolvable table reference)."
-        )
-
-    select_list = ", ".join(_quote(engine, c) for c in columns)
-    where_sql, params = _focus_where(engine, period_col, start, end, filters, period_dtype)
-    sql = f"SELECT {select_list} FROM {{focus_table}}{where_sql}"
-
-    result = _run(
-        environment_id=soe.environment_id,
-        auth_tenant=soe.auth_tenant,
-        sql=sql,
-        connection_id=str(getattr(dc, "id", "") or getattr(dc, "name", "") or ""),
-        response_id=None,
-        parameters=params or None,
-    )
-    err = result.get("error")
-    if err:
-        raise RuntimeError(f"focus_query failed on destination {getattr(dc, 'name', '?')!r}: {err}")
-    rows = result.get("rows") or []
-    if not rows:
-        return pl.DataFrame({c: [] for c in columns})
-    return pl.DataFrame(rows)
-
-
 def read_aggregated_cost(
     soe,
     dc,
@@ -375,11 +305,10 @@ def read_aggregated_cost(
 ) -> pl.DataFrame:
     """Aggregate a FOCUS **destination** IN SQL so only ~group-count rows are pulled.
 
-    Unlike ``read_destination_dataframe`` (which SELECTs raw rows and aggregates in polars),
-    this pushes the ``GROUP BY`` + ``SUM`` into BigQuery/Snowflake — the chargeback aggregation
-    over a large simulated export then returns in seconds (a handful of rows), not by streaming
-    the whole month (2.4M+ rows over HTTPS, which can stall). The sum is aliased to ``cost_col``
-    and ``COUNT(*)`` to ``row_count`` so downstream polars helpers consume it unchanged.
+    Pushes the ``GROUP BY`` + ``SUM`` into BigQuery/Snowflake so the chargeback aggregation over a
+    large export returns in seconds (a handful of rows), not by streaming the whole month (2.4M+
+    rows over HTTPS, which can stall). The sum is aliased to ``cost_col`` and ``COUNT(*)`` to
+    ``row_count`` so downstream polars helpers consume it unchanged.
 
     ``allocation_src`` / ``allocation_dst`` are additionally grouped on so the caller can still
     compute direct / allocation-in / allocation-out buckets from the per-(dimension, status) rows.
@@ -434,7 +363,7 @@ def read_aggregated_cost(
 # discovery routes through it; otherwise (unit tests, the deterministic core escape hatch) it
 # falls back to the conventional ``x_*`` defaults. The harness wires the real Stitcher-LLM
 # classifier here in ``build_server``.
-LLM_COLUMN_CLASSIFIER = None
+LLM_COLUMN_CLASSIFIER: Callable[[list[str]], Coroutine[Any, Any, dict]] | None = None
 
 
 def _is_provider_prefixed_x(col: str) -> bool:
@@ -510,8 +439,14 @@ async def _llm_classify_org_cost_center(candidate_x: list[str]) -> dict:
     from pydantic import BaseModel, Field
 
     class _OrgCostCenterMapping(BaseModel):
-        organization_column: str | None = Field(default=None, description="Closest x_* column naming an organization / business unit / division. None if none fit.")
-        cost_center_column: str | None = Field(default=None, description="Closest x_* column naming a cost center / team / project / department. None if none fit.")
+        organization_column: str | None = Field(
+            default=None,
+            description="Closest x_* column naming an organization / business unit / division. None if none fit.",
+        )
+        cost_center_column: str | None = Field(
+            default=None,
+            description="Closest x_* column naming a cost center / team / project / department. None if none fit.",
+        )
 
     from stitcher.pipeline.common.invoice_parser.parser_settings import get_parser_settings
     from stitcher.pipeline.common.invoice_parser.utils.openai_utils import get_openai_client
@@ -620,56 +555,12 @@ def resolve_group_by(schema: dict[str, str], group_by: str) -> str | None:
     return None
 
 
-# ── Polars aggregation helpers ──────────────────────────────────────────────
-
-
-def filter_period(df: pl.DataFrame, period_column: str | None, start: date, end: date) -> pl.DataFrame:
-    """Filter rows to ``start <= period_column < end``. Handles Datetime/Date columns and the
-    GCP ``invoice.month`` string column (``"202506"``) via prefix match on ``YYYY-MM``."""
-    if period_column is None or period_column not in df.columns:
-        return df
-    col = pl.col(period_column)
-    dtype = df.schema.get(period_column)
-    if dtype in (pl.Datetime, pl.Date):
-        return df.filter((col.cast(pl.Datetime) >= pl.lit(start)) & (col.cast(pl.Datetime) < pl.lit(end)))
-    # String period (e.g. invoice.month "202506"): match the YYYY-MM window by prefix.
-    ym_start = start.strftime("%Y%m")
-    ym_end = end.strftime("%Y%m")
-    return df.filter((col.str.slice(0, 6) >= ym_start) & (col.str.slice(0, 6) < ym_end))
-
-
-def aggregate_cost(df: pl.DataFrame, group_cols: list[str], cost_column: str, top_n: int = 20) -> pl.DataFrame:
-    """Group by ``group_cols``, sum ``cost_column`` (as Float64), count rows; sort by cost desc."""
-    agg = (
-        df.select([*group_cols, cost_column])
-        .with_columns(pl.col(cost_column).cast(pl.Float64, strict=False).alias("_cost"))
-        .group_by(group_cols)
-        .agg(pl.col("_cost").sum().round(2).alias("cost"), pl.len().alias("row_count"))
-        .sort("cost", descending=True)
-        .head(top_n)
-    )
-    return agg
-
-
-def equality_filters(df: pl.DataFrame, filters: dict | None) -> pl.DataFrame:
-    """Apply ``{column: value}`` equality filters (best-effort; unknown columns ignored)."""
-    if not filters:
-        return df
-    exprs = [pl.col(c) == v for c, v in filters.items() if c in df.columns]
-    return df.filter(pl.all_horizontal(exprs)) if exprs else df
-
-
 __all__ = [
     "LLM_COLUMN_CLASSIFIER",
-    "aggregate_cost",
     "classify_org_cost_center",
-    "equality_filters",
-    "filter_period",
     "list_chargeback_destinations",
-    "load_data_connection",
     "read_cost_schema",
     "read_aggregated_cost",
-    "read_destination_dataframe",
     "resolve_destination",
     "resolve_allocation_columns",
     "resolve_billing_account_column",

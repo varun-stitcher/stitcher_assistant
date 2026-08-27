@@ -6,12 +6,14 @@ Each module exposes ``register(mcp, client, soe)`` (tools that need Stitcher sta
 stays a thin caller.
 
 Modules:
+  - common        — shared tool prelude (``prep_read`` / refusals / window clamp) + the
+                    cost-summary / share-table renderers.
   - settings      — ``ChargebackSettings`` (env-tunable) + the chargeback business-policy defaults.
   - period        — ``resolve_period`` (YYYY-MM / last_month / rolling window).
-  - cost_reader   — SOE extract-based cost reader (``read_cost_schema`` / ``read_cost_dataframe`` /
-                    column discovery) — the same machinery ``scan_data`` uses, in polars.
-  - schema_tools  — ``discover_cost_schema`` + column classification / pick.
-  - formatting    — money / bytes / markdown-table rendering shared by the report/invoice/query tools.
+  - cost_reader   — SOE focus-query SQL cost reader (destination resolution, schema probe,
+                    SQL ``GROUP BY``/``SUM`` aggregation, column discovery).
+  - schema_tools  — ``discover_cost_schema`` + ``list_chargeback_destinations`` + column classification.
+  - formatting    — money / markdown-table rendering shared by the report/invoice/query tools.
   - report_tools  — ``chargeback_by_billing_account`` / ``chargeback_by_cost_center`` /
                     ``chargeback_provider_lineage``.
   - invoice_tools — ``generate_chargeback_invoices`` / ``discover_erp_integrations`` /

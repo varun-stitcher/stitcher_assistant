@@ -1,25 +1,21 @@
 """Ad-hoc FOCUS cost query tool — ``query_focus_cost`` (synchronous, destination SQL path).
 
 Reads a FOCUS data-lake **destination** (what Stitcher has written) via the SOE focus-query SQL
-path (``cost_reader.read_destination_dataframe`` → ``_run_focus_query``) and aggregates in
-polars. Chargeback only reads **destinations** — never arbitrary source datasources — so the
-column defaults are FOCUS-normalized (``BilledCost`` / ``ChargePeriodStart`` / …). Omit
-``data_source`` to auto-resolve the environment's single FOCUS data lake.
+path (``cost_reader.read_aggregated_cost`` — the GROUP BY/SUM is pushed into BigQuery/Snowflake).
+Chargeback only reads **destinations** — never arbitrary source datasources — so the column
+defaults are FOCUS-normalized (``BilledCost`` / ``ChargePeriodStart`` / …). Omit ``data_source``
+to auto-resolve the environment's single FOCUS data lake.
 
-Unknown ``group_by`` / ``cost_column`` values are refused (never guessed); allocation-based
-group_by is only offered when the destination exposes the matching ``x_Allocation*`` column.
-Period + equality filters are pushed into the SQL WHERE (query-parameter bound — no injection).
+Unknown ``group_by`` / ``cost_column`` values are refused (never guessed); period + equality
+filters are pushed into the SQL WHERE (query-parameter bound — no injection).
 """
 
 from __future__ import annotations
 
-import polars as pl
 from fastmcp import FastMCP
 
+from . import common as cm
 from . import cost_reader as cr
-from . import formatting as fmt
-from .period import resolve_period
-from .schema_tools import _resolve_env_id
 
 
 def register(mcp: FastMCP, client, soe) -> None:
@@ -38,17 +34,19 @@ def register(mcp: FastMCP, client, soe) -> None:
     ) -> str:
         """General-purpose cost query against a FOCUS data-lake **destination** (synchronous).
 
-        Aggregates cost by a dimension (any column, or a short alias: service, provider,
-        billing_account, region) over a period, with optional equality filters. Reads the
-        destination via the SOE focus-query SQL path (BigQuery / Snowflake) and aggregates in
-        polars. Chargeback only reads destinations (what Stitcher has written) — never source
-        datasources.
+        Aggregates cost by one or more dimensions (any column, or a short alias: service, provider,
+        billing_account, region, cost_center, organization) over a period, with optional equality
+        filters. Pass comma-separated dimensions for a cross-tab, e.g.
+        ``group_by="cost_center,service"`` → one row per (cost center, service) pair. Reads the
+        destination via the SOE focus-query SQL path (BigQuery / Snowflake). Chargeback only
+        reads destinations (what Stitcher has written) — never source datasources.
 
         Args:
             data_source: Name or id of the **destination** (a FOCUS data-lake export connection).
                 Omit to auto-resolve the environment's single FOCUS data lake.
-            group_by: Dimension column (a literal column name or an alias: service, provider,
-                billing_account, region). Default ``service``.
+            group_by: Dimension column(s) — a literal column name or an alias (service, provider,
+                billing_account, region, cost_center, organization), comma-separated for a
+                cross-tab. Default ``service``.
             period: ``YYYY-MM`` (e.g. "2026-03") or "last_month" — overrides since_days.
             since_days: Rolling-window fallback when ``period`` is omitted.
             top_n: Max rows (capped at 200).
@@ -58,81 +56,58 @@ def register(mcp: FastMCP, client, soe) -> None:
             filters: Optional ``{column: value}`` equality filters (pushed into the SQL WHERE).
             environment_id: Scope.
         """
+        tool = "query_focus_cost"
         try:
-            _resolve_env_id(soe, environment_id)
-        except RuntimeError as exc:
+            dc, schema, cost_col = cm.prep_read(soe, tool, data_source, environment_id, cost_column)
+        except cm.ToolRefusal as exc:
             return str(exc)
 
-        try:
-            dc = cr.load_data_connection(soe, data_source)
-        except Exception as e:  # noqa: BLE001
-            return f"ERR (query_focus_cost): could not load destination {data_source!r}: {str(e)[:250]}"
-        schema = cr.read_cost_schema(soe, dc)
-        if not schema:
-            return (
-                f"ERR (query_focus_cost): no schema discovered for destination {data_source!r}."
-            )
-
-        # Resolve the cost column: explicit cost_column wins; else metric alias; else discovery.
-        metric_map = {"billed": "BilledCost", "list": "ListCost", "effective": "EffectiveCost"}
-        cost_col = cost_column
-        metric_col = metric_map.get(metric.lower(), "")
-        if not cost_col and metric_col in schema:
-            cost_col = metric_col
+        # Explicit cost_column wins; else the metric alias; else discovery.
         if not cost_col:
-            cost_col = cr.resolve_cost_column(schema)
+            metric_col = {"billed": "BilledCost", "list": "ListCost", "effective": "EffectiveCost"}.get(
+                metric.lower(), ""
+            )
+            cost_col = metric_col if metric_col in schema else cr.resolve_cost_column(schema)
         if not cost_col:
-            return (
-                f"ERR (query_focus_cost): could not identify a cost column in the destination. "
-                f"Columns seen: {', '.join(sorted(schema))}. Pass cost_column explicitly."
-            )
+            return cm.refusal(tool, "cost", schema)
 
-        group_col = cr.resolve_group_by(schema, group_by)
-        if not group_col:
-            return (
-                f"ERR (query_focus_cost): Invalid group_by {group_by!r}. It is not a column in "
-                f"the destination nor a known alias (service, provider, billing_account, region). "
-                f"Columns: {', '.join(sorted(schema))}."
-            )
+        # Resolve every group_by token (literal column name or alias); dedupe, cap at 4 dims.
+        tokens = [t.strip() for t in group_by.split(",") if t.strip()] or ["service"]
+        if len(tokens) > 4:
+            return f"ERR ({tool}): at most 4 group_by dimensions are supported, got {len(tokens)}."
+        dim_cols: list[str] = []
+        for tok in tokens:
+            col = cr.resolve_group_by(schema, tok)
+            if not col:
+                return (
+                    f"ERR ({tool}): Invalid group_by {tok!r}. It is not a column in "
+                    f"the destination nor a known alias (service, provider, billing_account, region, "
+                    f"cost_center, organization). Columns: {', '.join(sorted(schema))}."
+                )
+            if col not in dim_cols:
+                dim_cols.append(col)
 
         period_col = cr.resolve_period_column(schema, period_column)
-        top_n = max(1, min(top_n, 200))
-        since_days = max(1, min(since_days, 365))
-        start, end, period_label = resolve_period(period, since_days)
+        start, end, period_label = cm.resolve_window(period, since_days)
 
         # Aggregate IN SQL so we pull ~group-count rows, not the whole month.
         try:
             df = cr.read_aggregated_cost(
-                soe, dc, [group_col], cost_col, period_col, start, end, filters, schema.get(period_col), top_n=top_n
+                soe, dc, dim_cols, cost_col, period_col, start, end, filters, schema.get(period_col), top_n=200
             )
         except Exception as e:  # noqa: BLE001
-            return f"ERR (query_focus_cost): could not read destination: {str(e)[:300]}"
-        if df is None or df.is_empty():
+            return f"ERR ({tool}): could not read destination: {str(e)[:300]}"
+        if df.is_empty():
             return f"No rows in the destination for {period_label}."
 
-        # SQL already applied the period + equality filters; keep polars filters as a no-op safety net
-        # (they no-op when the columns aren't in the frame).
-        df = cr.equality_filters(df, filters)
-        agg = cr.aggregate_cost(df, [group_col], cost_col, top_n)
-        try:
-            total = float(df.select(pl.col(cost_col).cast(pl.Float64, strict=False).sum()).item() or 0.0)
-        except Exception:  # noqa: BLE001
-            total = float(agg.select(pl.col("cost").sum()).item() or 0.0)
-
-        header = [group_col, f"cost ({metric}, USD)", "rows", "% share"]
-        lines = [
-            f"# Cost by {group_col} — {period_label}",
-            f"source: `{getattr(dc, 'name', data_source)}`  ·  {df.height} rows in window",
-            "",
-            "| " + " | ".join(header) + " |",
-            "|" + "---|" * len(header),
-        ]
-        for r in agg.iter_rows(named=True):
-            dim = r.get(group_col)
-            dim_s = "" if dim is None else str(dim)
-            cost = float(r.get("cost") or 0.0)
-            share = (cost / total * 100.0) if total else 0.0
-            lines.append(f"| {dim_s} | {fmt.fmt_money(cost)} | {r.get('row_count', 0)} | {share:.1f}% |")
-        lines.append("")
-        lines.append(f"**Total: {fmt.fmt_money(total)}** across {df.height} charge records.")
-        return "\n".join(lines)
+        rows, total, records = cm.cost_summary(df, dim_cols, cost_col, max(1, min(top_n, 200)))
+        return cm.share_table(
+            f"Cost by {' + '.join(dim_cols)}",
+            getattr(dc, "name", data_source),
+            records,
+            period_label,
+            dim_cols,
+            total,
+            rows,
+            metric=metric.lower() or "billed",
+        )

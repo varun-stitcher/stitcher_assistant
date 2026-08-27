@@ -2,11 +2,11 @@
 
 Following the human-in-the-loop audit pattern (mirrors ``test_config_generation_tools.py``): every
 safety boundary gets a test proving the wrong path is never taken (refusal, materiality rollup,
-unknown-value refusal). The SOE extract read is DETERMINISTIC in these tools — the only mutable
-part is the datasource being read — so we patch ``cost_reader.load_data_connection`` /
-``read_cost_schema`` / ``read_destination_dataframe`` with a synthetic polars cost destination and assert
-on the DETERMINISTIC tool logic (column mapping, polars aggregation, materiality rollup, ERP
-gating, allocation lineage). No live network, no GCS export.
+unknown-value refusal). The SOE focus-query SQL read is DETERMINISTIC in these tools — the only
+mutable part is the destination being read — so we patch ``cost_reader.resolve_destination`` /
+``read_cost_schema`` / ``read_aggregated_cost`` with a synthetic polars cost destination and assert
+on the DETERMINISTIC tool logic (column mapping, aggregation shaping, materiality rollup, ERP
+gating, allocation lineage). No live network.
 
 Boundaries under test
 ---------------------
@@ -143,14 +143,10 @@ def _patch_cost_reader(monkeypatch, schema, df):
         # polars rendering on top of it).
         return df
 
-    def fake_df(soe, d, columns=None, period_col=None, start=None, end=None, filters=None, period_dtype=None):
-        return df
-
-    monkeypatch.setattr(cr, "load_data_connection", fake_load)
+    monkeypatch.setattr(cr, "resolve_destination", fake_load)
     monkeypatch.setattr(cr, "read_cost_schema", fake_schema)
     monkeypatch.setattr(cr, "read_aggregated_cost", fake_agg)
-    monkeypatch.setattr(cr, "read_destination_dataframe", fake_df)
-    return dc, fake_load, fake_schema, fake_df
+    return dc
 
 
 @pytest.fixture(scope="module")
@@ -342,6 +338,48 @@ def test_query_unknown_group_by(server, monkeypatch):
     assert "ERR" in txt and "Invalid group_by" in txt
 
 
+def test_query_cross_tab_cost_center_plus_service(server, monkeypatch):
+    """Comma-separated group_by dims → ONE cross-tab table (cost center + service in a row),
+    not two separate tables."""
+    txt = _call(
+        server,
+        "query_focus_cost",
+        {"data_source": "focus", "group_by": "x_CostCenter,ServiceName"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_SVC_SCHEMA,
+        df=_FOCUS_SVC_ROWS,
+    )
+    assert "ERR" not in txt
+    assert "x_CostCenter | ServiceName" in txt  # both dims in the header
+    assert "cc-120" in txt and "Compute Engine" in txt  # one row per (cc, service) pair
+
+
+def test_query_cost_center_alias_resolves_x_column(server, monkeypatch):
+    """The deterministic cost_center alias resolves the conventional x_CostCenter column (no LLM)."""
+    txt = _call(
+        server,
+        "query_focus_cost",
+        {"data_source": "focus", "group_by": "cost_center"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_SVC_SCHEMA,
+        df=_FOCUS_SVC_ROWS,
+    )
+    assert "ERR" not in txt
+    assert "x_CostCenter" in txt  # header shows the resolved real column
+
+
+def test_query_too_many_dims_refused(server, monkeypatch):
+    txt = _call(
+        server,
+        "query_focus_cost",
+        {"data_source": "focus", "group_by": "a,b,c,d,e"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_SVC_SCHEMA,
+        df=_FOCUS_SVC_ROWS,
+    )
+    assert "ERR" in txt and "at most 4" in txt
+
+
 def test_query_cost_column_not_found(server, monkeypatch):
     _patch_cost_reader(monkeypatch, {"service.description": "String", "project.name": "String"}, _GCP_ROWS)
     res = asyncio.run(server.call_tool("query_focus_cost", {"data_source": "gcp", "group_by": "project.name"}))
@@ -395,12 +433,40 @@ def test_allocation_not_computed_without_alloc_columns(server, monkeypatch):
     assert "no allocation columns" in txt  # no x_Allocation* → direct-cost note
 
 
+# ── C8.5: SQL row_count must survive the render path (regression) ───────────
+def test_share_table_preserves_sql_row_count(server, monkeypatch):
+    """When read_aggregated_cost returns the SQL frame (with row_count), the rendered rows column
+    and the 'N charge records in window' line must reflect the SQL COUNT(*) — never collapse to 1
+    per group (the aggregate_cost re-group regression) or to the group count."""
+    sql_frame = pl.DataFrame(
+        {
+            "BillingAccountId": ["acct-a", "acct-b"],
+            "BilledCost": [100.0, 40.0],
+            "row_count": [1500, 300],
+        }
+    )
+    txt = _call(
+        server,
+        "chargeback_by_billing_account",
+        {"data_source": "focus"},
+        monkeypatch=monkeypatch,
+        schema={
+            "BilledCost": "Float64",
+            "ChargePeriodStart": "Datetime",
+            "BillingAccountId": "String",
+        },
+        df=sql_frame,
+    )
+    assert "1,500" in txt and "300" in txt  # per-account SQL record counts, not 1
+    assert "1,800 charge records in window" in txt  # 1500 + 300
+    assert "$140.00" in txt  # total across both groups
+
+
 # ── C9: invoice builder sanity + formatting ─────────────────────────────────
-def test_fmt_money_and_bytes():
+def test_fmt_money():
     assert fmt.fmt_money(0.0) == "—"
     assert fmt.fmt_money(-5.5) == "($5.50)"
     assert fmt.fmt_money(1234.5) == "$1,234.50"
-    assert fmt.format_bytes(2048) == "2.00 KB"
 
 
 def test_invoice_skips_unallocated_bucket_synthetic(server, monkeypatch):
