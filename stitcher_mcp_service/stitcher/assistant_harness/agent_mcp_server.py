@@ -250,4 +250,121 @@ def build_server() -> FastMCP:
                 out.update(res.result)
         return out
 
+    @mcp.tool
+    async def prepare_chargeback_report(
+        ctx: Context,
+        environment_id: str,
+        pipeline_name: str,
+        period: str = "last_month",
+        materiality_threshold: float | None = None,
+        auth_tenant: str = "",
+    ) -> dict[str, Any]:
+        """Run the monthly chargeback / showback report for an environment and return it as
+        structured markdown. The agent grounds on the env's FOCUS **destination** (what Stitcher
+        has WRITTEN — a BigQuery/Snowflake DB export; never the raw source connectors), activates
+        the chargeback sub-MCP, runs ``chargeback_by_cost_center``, and submits the report table
+        verbatim (direct / allocation-in / allocation-out lineage + materiality rollup).
+
+        Args:
+            environment_id: the Stitcher environment UUID (required).
+            pipeline_name: the pipeline the agent is bound to (required).
+            period: ``YYYY-MM`` (e.g. "2026-07") or "last_month".
+            materiality_threshold: USD floor below which cost centers roll into a "Miscellaneous"
+                row (the tool default applies when omitted).
+            auth_tenant: Keycloak realm / org id for SOE reads (recommended).
+
+        Returns:
+            ``{task, status, period, destination, markdown, summary, turns, elapsed_seconds}``
+            on success; ``{task, status:"failed", error}`` on failure.
+        """
+        if not period.strip():
+            return {"task": "prepare_chargeback_report", "status": "failed", "error": "period is required."}
+        threshold = f" materiality_threshold={materiality_threshold}" if materiality_threshold is not None else ""
+        prompt = (
+            f"Prepare the chargeback report for environment {environment_id} / pipeline {pipeline_name}, "
+            f"period={period}.{threshold}\n"
+            "GROUND FIRST: list_chargeback_destinations, then discover_cost_schema (confirm the "
+            "cost/period/cost-center mapping). Then activate_sub_mcp('chargeback'), call "
+            f"chargeback_by_cost_center(period={period!r}{threshold}), and submit_result with the "
+            "chargeback_report schema (the markdown table VERBATIM — do not collapse lineage "
+            "columns). Call submit_result IMMEDIATELY after the report tool returns, before any prose."
+        )
+        res = await _run_with_progress(
+            ctx, prompt, environment_id=environment_id, pipeline_name=pipeline_name, auth_tenant=auth_tenant
+        )
+        out: dict[str, Any] = {
+            "task": "prepare_chargeback_report",
+            "status": res.status,
+            "summary": res.text,
+            "turns": res.turns,
+            "elapsed_seconds": res.elapsed,
+            "run_dir": res.run_dir,
+        }
+        if res.status == "ok" and res.result:
+            out.update({k: v for k, v in res.result.items() if k != "task"})
+        else:
+            out["error"] = res.error
+            if res.result:
+                out.update({k: v for k, v in res.result.items() if k != "task"})
+        return out
+
+    @mcp.tool
+    async def explore_cost_data(
+        ctx: Context,
+        environment_id: str,
+        pipeline_name: str,
+        group_by: str = "service",
+        period: str = "last_month",
+        filters: str = "",
+        auth_tenant: str = "",
+    ) -> dict[str, Any]:
+        """Ad-hoc cost exploration against the env's FOCUS **destination** (agent-assisted).
+        Use for open-ended cost questions ("why did CC-2 spike", "top services by region") where
+        the caller hasn't pinned a single report. For a deterministic cross-tab prefer passing
+        comma-separated dimensions: ``group_by="cost_center,service"`` returns ONE table with one
+        row per (cost center, service) pair.
+
+        Args:
+            environment_id: the Stitcher environment UUID (required).
+            pipeline_name: the pipeline the agent is bound to (required).
+            group_by: dimension column(s) or aliases (service, provider, billing_account, region,
+                cost_center, organization) — comma-separated for a cross-tab.
+            period: ``YYYY-MM`` or "last_month".
+            filters: optional ``column=value`` equality filters (comma-separated pairs).
+            auth_tenant: Keycloak realm / org id for SOE reads (recommended).
+
+        Returns:
+            ``{task, status, period, destination, markdown, summary, turns, elapsed_seconds}``
+            on success; ``{task, status:"failed", error}`` on failure.
+        """
+        if not group_by.strip():
+            return {"task": "explore_cost_data", "status": "failed", "error": "group_by is required."}
+        prompt = (
+            f"Explore cost data for environment {environment_id} / pipeline {pipeline_name}.\n"
+            f"Ask: group_by={group_by!r}, period={period!r}, filters={filters!r}.\n"
+            "GROUND FIRST: list_chargeback_destinations, then discover_cost_schema. Then "
+            "activate_sub_mcp('chargeback') and call query_focus_cost(group_by=..., period=...). "
+            "A multi-dimensional ask is ONE cross-tab call — never two separate one-dimension "
+            "tables. Call submit_result IMMEDIATELY after the tool returns (the markdown table "
+            "verbatim), before any prose — submit_result with the chargeback_report schema."
+        )
+        res = await _run_with_progress(
+            ctx, prompt, environment_id=environment_id, pipeline_name=pipeline_name, auth_tenant=auth_tenant
+        )
+        out: dict[str, Any] = {
+            "task": "explore_cost_data",
+            "status": res.status,
+            "summary": res.text,
+            "turns": res.turns,
+            "elapsed_seconds": res.elapsed,
+            "run_dir": res.run_dir,
+        }
+        if res.status == "ok" and res.result:
+            out.update({k: v for k, v in res.result.items() if k != "task"})
+        else:
+            out["error"] = res.error
+            if res.result:
+                out.update({k: v for k, v in res.result.items() if k != "task"})
+        return out
+
     return mcp

@@ -3,10 +3,14 @@ the existing stitcher_web_service_client). Register on the mcp server."""
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 from fastmcp import FastMCP
 
 from ..common.client import StitcherClient
 from ..common.config import StitcherAssistantConfig
+from ..sub_mcp_agents.chargeback.policy import DESTINATION_ONLY_SUMMARY
+
 
 # Capabilities catalog for the always-active `stitcher_capabilities` tool. Each
 # sub-MCP bundle hosts tools that are INACTIVE until activated via
@@ -15,7 +19,15 @@ from ..common.config import StitcherAssistantConfig
 # are available" — e.g. via stitcher_context — immediately learns a bundle
 # exists and the exact one-line way to turn its tools on, instead of hunting in
 # the shell for capabilities that only exist as MCP tools.
-_SUB_MCP_CATALOG = {
+class _BundleEntry(TypedDict):
+    """One catalog row (TypedDict so mypy keeps `tools` a dict, not a Collection join)."""
+
+    purpose: str
+    activate: str
+    tools: dict[str, str]
+
+
+_SUB_MCP_CATALOG: dict[str, _BundleEntry] = {
     "custom_cost": {
         "purpose": "FOCUS cost normalization + validation — bring any invoice PDF/CSV and normalize it to the FOCUS v1.2 column shape.",
         "activate": 'activate_sub_mcp(name="custom_cost")',
@@ -40,12 +52,7 @@ _SUB_MCP_CATALOG = {
         },
     },
     "chargeback": {
-        "purpose": (
-            "Run cloud chargeback / cost reports on the env's FOCUS **destination** — what Stitcher has "
-            "WRITTEN (BigQuery/Snowflake DB export). NEVER scans the source datasources: omit ``data_source`` "
-            "and every tool auto-resolves the env's FOCUS destination. Cost questions ('run chargeback for "
-            "July', 'top services by cost', 'showback') belong HERE, not in list_data_sources/scan_data."
-        ),
+        "purpose": DESTINATION_ONLY_SUMMARY,
         "activate": 'activate_sub_mcp(name="chargeback")',
         "tools": {
             "list_chargeback_destinations()": "GROUND FIRST: the env's queryable FOCUS destinations (e.g. BigQuery Export). Call before any report.",

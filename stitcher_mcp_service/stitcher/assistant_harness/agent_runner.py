@@ -121,6 +121,61 @@ def _wait_mcp(port: int, timeout_s: float = 40.0) -> bool:
     return False
 
 
+REPORT_TOOL_NAMES = (
+    "chargeback_by_cost_center",
+    "chargeback_by_billing_account",
+    "chargeback_provider_lineage",
+    "query_focus_cost",
+)
+
+
+def harvest_chargeback_markdown(run_dir: str) -> dict[str, Any]:
+    """Harvest the newest chargeback report tool result from the session transcript.
+
+    The agent is told to ``submit_result`` the report verbatim, but the model sometimes answers in
+    prose instead — and its prose re-summarizes numbers it did not compute. The deterministic
+    tool's OWN return text is the artifact (same principle as ``harvest_saved_config``: the
+    persisted artifact is authoritative). Walks the session transcript in order and returns the
+    text of the LAST non-error result of a chargeback report tool, wrapped with honest provenance;
+    {} when nothing usable was found."""
+    if not run_dir:
+        return {}
+    session_dir = pathlib.Path(run_dir) / "_session"
+    if not session_dir.exists():
+        return {}
+    harvested = ""
+    for tf in sorted(session_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
+        for line in tf.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if ev.get("type") != "message":
+                continue
+            msg = ev.get("message") or {}
+            if msg.get("role") != "toolResult" or msg.get("isError"):
+                continue
+            if msg.get("toolName") not in REPORT_TOOL_NAMES:
+                continue
+            for block in msg.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
+                    text = str(block["text"]).strip()
+                    if text.startswith("ERR"):
+                        continue  # a tool refusal is not a report
+                    if "|" in text and "#" in text:  # a rendered report table, not an ERR string
+                        harvested = text
+    if not harvested:
+        return {}
+    return {
+        "task": "chargeback_report",
+        "status": "completed",
+        "markdown": harvested,
+        "source": "harvested_from_transcript",
+    }
+
+
 def _base_env() -> dict[str, str]:
     """The STITCHER_* infra vars the tool MCP + pi both need (creds/api/ssl), inherited from the
     gateway process env. Per-call scope is layered on top in `run()`."""
@@ -132,6 +187,26 @@ def _base_env() -> dict[str, str]:
     if "/opt/homebrew/bin" not in env.get("PATH", ""):
         env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "")
     return env
+
+
+def _message_tool_names(line: dict) -> list[str]:
+    """Tool-call names carried by one pi session-transcript line (empty when none).
+
+    pi writes assistant turns as ``{"type": "message", "message": {"role": "assistant",
+    "content": [{"type": "toolCall", "name": …}, …]}}`` — tool calls are content blocks with
+    ``type: "toolCall"``. (An earlier version filtered on a top-level ``type == "assistant"``
+    which matches nothing in the real format — every turn looked tool-less and the progress
+    stream stayed silent while the turn ran.)"""
+    if line.get("type") != "message":
+        return []
+    msg = line.get("message") or {}
+    if msg.get("role") != "assistant":
+        return []
+    names: list[str] = []
+    for block in msg.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "toolCall" and block.get("name"):
+            names.append(str(block["name"]))
+    return names
 
 
 class AgentRunner:
@@ -254,47 +329,47 @@ class AgentRunner:
 
             # ── 3. tail the session transcript for progress while pi runs ──────────────────
             timed_out = False
-            transcript_file = session_dir / f"{sid}.jsonl"
+
+            def _session_files() -> list[pathlib.Path]:
+                """The pi session transcript(s) for THIS turn. pi names them
+                ``<ISO-stamp>_<session-id>.jsonl`` — a timestamp PREFIX, so an exact
+                ``{sid}.jsonl`` path never exists; glob and keep the newest match."""
+                return sorted(session_dir.glob(f"*{sid}*.jsonl"), key=lambda p: p.stat().st_mtime)
 
             def _tail() -> int:
                 """Best-effort: count tool calls + forward progress events. Returns tool-call count."""
                 turns = 0
-                pos = 0
+                offsets: dict[str, int] = {}  # per-file read position (files may roll over)
                 last_emit = 0.0
                 while proc.poll() is None:
-                    if transcript_file.exists():
+                    for tf in _session_files():
+                        pos = offsets.get(str(tf), 0)
                         try:
-                            with open(transcript_file, "rb") as tf:
-                                tf.seek(pos)
-                                chunk = tf.read()
-                                pos += len(chunk)
-                            for line in chunk.splitlines():
-                                if not line.strip():
-                                    continue
-                                try:
-                                    ev = json.loads(line)
-                                except Exception:  # noqa: BLE001
-                                    continue
-                                etype = ev.get("type")
-                                if etype == "assistant":
-                                    # a toolCall content block = one orchestration step
-                                    content = ev.get("content") or []
-                                    if isinstance(content, list):
-                                        for b in content:
-                                            if isinstance(b, dict) and b.get("type") == "toolCall":
-                                                turns += 1
-                                                if on_event and time.time() - last_emit >= 0.5:
-                                                    on_event(
-                                                        {
-                                                            "stage": "orchestrating",
-                                                            "message": f"tool: {b.get('name', '?')}",
-                                                            "tool": b.get("name", ""),
-                                                            "turn": turns,
-                                                        }
-                                                    )
-                                                    last_emit = time.time()
+                            with open(tf, "rb") as f:
+                                f.seek(pos)
+                                chunk = f.read()
+                                offsets[str(tf)] = pos + len(chunk)
                         except Exception:  # noqa: BLE001 — transcript may be mid-write
-                            pass
+                            continue
+                        for line in chunk.splitlines():
+                            if not line.strip():
+                                continue
+                            try:
+                                ev = json.loads(line)
+                            except Exception:  # noqa: BLE001
+                                continue
+                            for name in _message_tool_names(ev):
+                                turns += 1
+                                if on_event and time.time() - last_emit >= 0.5:
+                                    on_event(
+                                        {
+                                            "stage": "orchestrating",
+                                            "message": f"tool: {name}",
+                                            "tool": name,
+                                            "turn": turns,
+                                        }
+                                    )
+                                    last_emit = time.time()
                     time.sleep(0.2)
                 return turns
 
@@ -310,14 +385,13 @@ class AgentRunner:
 
             answer = out_f.read_text().strip()
             turns = 0  # recompute from transcript (tail thread's count is local)
-            if transcript_file.exists():
-                for line in transcript_file.read_text().splitlines():
+            for tf in _session_files():
+                for line in tf.read_text().splitlines():
                     try:
                         ev = json.loads(line)
                     except Exception:  # noqa: BLE001
                         continue
-                    if ev.get("type") == "assistant" and isinstance(ev.get("content"), list):
-                        turns += sum(1 for b in ev["content"] if isinstance(b, dict) and b.get("type") == "toolCall")
+                    turns += len(_message_tool_names(ev))
 
             # ── 4. read the capture file the agent wrote via submit_result ────────────────
             result: dict[str, Any] = {}
@@ -335,8 +409,16 @@ class AgentRunner:
                 status = "timed_out"
                 error = f"pi turn timed out after {timeout}s."
             else:
-                status = "no_structured_output"
-                error = "the agent did not call submit_result (no structured output produced)."
+                # The agent answered but never called submit_result. For chargeback report tools
+                # the deterministic tool output in the transcript IS the artifact — harvest it
+                # (provenance-tagged), never the model's prose re-summary.
+                harvested = harvest_chargeback_markdown(str(run_dir))
+                if harvested:
+                    result = harvested
+                    status = "ok"
+                else:
+                    status = "no_structured_output"
+                    error = "the agent did not call submit_result (no structured output produced)."
 
             return AgentResult(
                 status=status,

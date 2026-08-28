@@ -21,12 +21,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import pathlib
 import time
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .agent_runner import AgentRunner
 
@@ -35,6 +36,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _runner: AgentRunner | None = None
+
+#: The minimal chat UI served at ``/`` — a test/demo surface for the streaming contract
+#: (progress on the stitcher extension, terminal delta.ui rendered as a report artifact).
+_CHAT_HTML_PATH = pathlib.Path(__file__).resolve().parent / "gateway_chat.html"
+_chat_html_cache: str | None = None
+
+
+def _chat_html() -> str:
+    global _chat_html_cache
+    if _chat_html_cache is None:
+        _chat_html_cache = _CHAT_HTML_PATH.read_text()
+    return _chat_html_cache
 
 
 def _get_runner() -> AgentRunner:
@@ -86,6 +99,30 @@ def _extract_scope(body: dict) -> tuple[dict, str]:
     return {"environment_id": environment_id, "pipeline_name": pipeline_name, "auth_tenant": auth_tenant}, ""
 
 
+def _format_progress(ev: dict) -> str:
+    """One line of human-readable progress from a runner transcript event."""
+    stage = str(ev.get("stage") or "working")
+    message = str(ev.get("message") or "").replace("\n", " ")[:160]
+    turn = ev.get("turn")
+    prefix = f"[{turn}] " if isinstance(turn, int) and turn else ""
+    return f"{prefix}{stage}: {message}".strip()
+
+
+def _terminal_ui(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Map the agent's submitted result (the ``submit_result`` capture) to the terminal chunk's
+    ``delta.ui``. Chargeback reports get the typed ``kind: "chargeback_report"`` shape the SPC
+    transport/plugin can render; any other structured result passes through verbatim."""
+    if not isinstance(result, dict) or not result:
+        return None
+    if str(result.get("task") or "") == "chargeback_report":
+        ui: dict[str, Any] = {"kind": "chargeback_report"}
+        for k in ("period", "markdown", "destination", "status", "question", "error"):
+            if result.get(k):
+                ui[k] = result[k]
+        return ui
+    return result
+
+
 def _openai_chunk(delta: dict, model: str, finish: str | None = None, stitcher: dict | None = None) -> str:
     chunk: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -102,6 +139,13 @@ def _openai_chunk(delta: dict, model: str, finish: str | None = None, stitcher: 
 @router.get("/health")
 async def health() -> dict:
     return {"ok": True, "model": _MODEL_ID}
+
+
+@router.get("/")
+@router.get("/chat")
+async def chat_ui() -> Response:
+    """The minimal chat UI (gateway_chat.html) — test/demo surface for this agent's streaming."""
+    return Response(content=_chat_html(), media_type="text/html")
 
 
 @router.get("/v1/models")
@@ -136,15 +180,13 @@ async def chat_completions(request: Request) -> Any:
     if scope_err:
         return JSONResponse({"error": {"message": scope_err, "type": "invalid_request_error"}}, status_code=400)
 
-    async def _run() -> Any:
-        runner = _get_runner()
-        return await asyncio.to_thread(runner.run, message, **scope)
-
     if not stream:
-        res = await _run()
+        runner = _get_runner()
+        res = await asyncio.to_thread(runner.run, message, **scope)
         msg: dict[str, Any] = {"role": "assistant", "content": res.text}
-        if res.result:
-            msg["ui"] = res.result
+        ui = _terminal_ui(res.result)
+        if ui:
+            msg["ui"] = ui
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "created": int(time.time()),
@@ -154,16 +196,40 @@ async def chat_completions(request: Request) -> Any:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
-    # Streaming — SSE chunks: a start marker, then the terminal answer + structured ui.
+    # Streaming — SSE chunks: start marker, LIVE progress on the `stitcher` extension (one chunk
+    # per tool call the agent makes, streamed as it happens — the runner's transcript tail feeds
+    # on_event), then the terminal answer + structured ui (kind: "chargeback_report" for report
+    # tasks) and [DONE].
     async def _stream():
+        runner = _get_runner()
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue[dict] = asyncio.Queue()
+
+        def _on_event(ev: dict) -> None:
+            loop.call_soon_threadsafe(events.put_nowait, ev)
+
         yield _openai_chunk({"role": "assistant"}, model, stitcher={"kind": "status", "msg": "Thinking…"})
-        res = await _run()
+
+        task = asyncio.create_task(asyncio.to_thread(runner.run, message, on_event=_on_event, **scope))
+        while not task.done():
+            try:
+                ev = await asyncio.wait_for(events.get(), timeout=0.25)
+            except TimeoutError:
+                continue
+            yield _openai_chunk({}, model, stitcher={"kind": "tool", "msg": _format_progress(ev)})
+        res = await task
+        # Final drain — events queued right before the turn finished must still stream.
+        while not events.empty():
+            yield _openai_chunk({}, model, stitcher={"kind": "tool", "msg": _format_progress(events.get_nowait())})
+
+        ui = _terminal_ui(res.result)
+        # Contract (mirrors config-gen sse_server): the human text is one delta.content chunk, and
+        # the terminal chunk carries **delta.ui** (finish_reason=stop) — the SPC transport reads
+        # delta.ui / message.ui, NOT the stitcher extension.
         delta: dict[str, Any] = {"content": res.text}
-        terminal: dict[str, Any] = {"content": res.text}
-        if res.result:
-            terminal["ui"] = res.result
-        yield _openai_chunk(delta, model)
-        yield _openai_chunk({}, model, finish="stop", stitcher=terminal)
+        if ui:
+            delta["ui"] = ui
+        yield _openai_chunk(delta, model, finish="stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
