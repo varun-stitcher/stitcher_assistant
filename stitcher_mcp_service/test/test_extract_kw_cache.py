@@ -17,10 +17,10 @@ import os
 os.environ.setdefault("STITCHER_STEP_CACHE_DIR", "/tmp/kw-test-suite")
 
 from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools import kw_cache  # noqa: E402
-from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.extract_tools import (  # noqa: E402
+from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.extraction.extract_tools import (  # noqa: E402
     register as extract_register,
 )
-from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.focus_normalization_tools import (  # noqa: E402
+from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.focus.focus_normalization_tools import (  # noqa: E402
     register as fnorm_register,
 )
 

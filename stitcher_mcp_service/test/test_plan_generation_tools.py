@@ -26,7 +26,7 @@ G6. The emitted config validates against the real ``InlineNormalizeDatasourceDto
 
 import polars as pl
 
-from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools import plan_generation_tools as pgt
+from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.plan import plan_generation_tools as pgt
 from stitcher.pipeline.common.focus_column_names import FocusColumnNames as F
 from stitcher.pipeline.common.pipeline_config_models.versions.v1_alpha.normalize.normalize_config import (
     InlineNormalizeDatasourceDto,

@@ -48,6 +48,7 @@ import logging
 import os
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import polars as pl
@@ -90,7 +91,11 @@ def _report_to_dict(report) -> dict[str, Any]:
 
 
 def _failed_checks(report) -> list[dict[str, Any]]:
-    return [c.to_dict() if hasattr(c, "to_dict") else c for c in report.checks if not c.passed and c.severity == "FAIL"]
+    return [
+        c.to_dict() if hasattr(c, "to_dict") else c
+        for c in report.checks
+        if not c.passed and c.severity == "FAIL"
+    ]
 
 
 def _missing_mandatory(df: pl.DataFrame) -> list[str]:
@@ -106,14 +111,23 @@ async def _maybe_infer_currency(raw_df: pl.DataFrame) -> str | None:
     """
     from llama_index.core.llms import ChatMessage, MessageRole
 
-    from stitcher.pipeline.common.invoice_parser.parser_settings import get_parser_settings
-    from stitcher.pipeline.common.invoice_parser.utils.openai_utils import get_openai_client
-    from stitcher.pipeline.common.pipeline_config_models.ai.common.ai_agent_proxy.base import LLMAgentProxy
+    from stitcher.pipeline.common.invoice_parser.parser_settings import (
+        get_parser_settings,
+    )
+    from stitcher.pipeline.common.invoice_parser.utils.openai_utils import (
+        get_openai_client,
+    )
+    from stitcher.pipeline.common.pipeline_config_models.ai.common.ai_agent_proxy.base import (
+        LLMAgentProxy,
+    )
 
     settings = get_parser_settings()
     client = get_openai_client()
     proxy = LLMAgentProxy(
-        model=settings.task_model, client=client, sai_product="custom_cost", sai_product_step="focus_validation"
+        model=settings.task_model,
+        client=client,
+        sai_product="custom_cost",
+        sai_product_step="focus_validation",
     )
 
     sample = raw_df.head(5).write_csv()
@@ -153,6 +167,7 @@ def register(mcp: FastMCP) -> None:
         billing_currency: str | None = None,
         llm_repair: bool = False,
         max_sample_rows: int = 5,
+        official_validation: bool = False,
     ) -> dict[str, Any]:
         """Validate a normalized FOCUS frame and repair deterministic gaps (e.g. currency).
 
@@ -184,11 +199,27 @@ def register(mcp: FastMCP) -> None:
         call this tool makes — always gated to a valid ISO code and re-validated).
         ``llm_repair=false`` (default) makes ZERO LLM calls on the ``raw_df_json``
         path — the human escape hatch.
+
+        ``official_validation=true`` adds a SECOND, independent opinion: after the
+        internal validate/repair pass, the final frame is also run through the
+        official FinOps Foundation focus_validator (isolated subprocess, zero LLM)
+        and its conformance report is returned under ``official_validation``. The
+        official validator is STRICTER than the internal one (checks ~578 rules
+        incl. column presence for the full FOCUS 1.2 schema), so expect failures
+        the internal validator does not report. Its failure (e.g. unbootstrapped
+        venv) is reported as ``official_validation_error`` WITHOUT failing the
+        internal result.
         """
         t0 = time.time()
 
         def _err(message: str, **extra: Any) -> dict[str, Any]:
-            return {"success": False, "compliant": False, "error": message, "elapsed_seconds": _now() - t0, **extra}
+            return {
+                "success": False,
+                "compliant": False,
+                "error": message,
+                "elapsed_seconds": _now() - t0,
+                **extra,
+            }
 
         # ── Input validation ──────────────────────────────────────────
         has_file = bool(file_path or pdf_b64)
@@ -202,7 +233,9 @@ def register(mcp: FastMCP) -> None:
         if billing_currency is not None:
             currency_value = billing_currency.strip().upper()
             if not (len(currency_value) == 3 and currency_value.isalpha()):
-                return _err(f"billing_currency must be a 3-letter ISO 4217 code, got {billing_currency!r}.")
+                return _err(
+                    f"billing_currency must be a 3-letter ISO 4217 code, got {billing_currency!r}."
+                )
 
         raw_df: pl.DataFrame
         source: str
@@ -212,6 +245,19 @@ def register(mcp: FastMCP) -> None:
                 assert raw_df_json is not None
                 raw_df = _df_from_json(raw_df_json)
                 source = "<provided raw_df_json>"
+            elif file_path and file_path.endswith((".parquet",)):
+                # Parquet artifact (e.g. normalize_to_focus's normalized_parquet) —
+                # read directly, NO extraction, NO LLM. Keeps the input contract
+                # consistent with validate_focus_official.
+                from . import focus_normalization_tools as fnt
+
+                p = Path(file_path)
+                if not p.is_file():
+                    return _err(f"data file not found: {file_path}")
+                raw_df = pl.read_parquet(p)
+                if raw_df.is_empty():
+                    return _err(f"parquet file has no rows: {file_path}")
+                source = file_path
             else:
                 from . import focus_normalization_tools as fnt
 
@@ -220,12 +266,16 @@ def register(mcp: FastMCP) -> None:
                     if pdf_b64:
                         ext = fnt._ext_for(filename, None)
                         if ext not in ("pdf", "csv"):
-                            return _err(f"Unsupported file type {ext!r}; bring a PDF or CSV.")
+                            return _err(
+                                f"Unsupported file type {ext!r}; bring a PDF or CSV."
+                            )
                         try:
                             raw_bytes = base64.b64decode(pdf_b64, validate=True)
                         except (ValueError, TypeError) as e:
                             return _err(f"pdf_b64 is not valid base64: {e}")
-                        with tempfile.NamedTemporaryFile(mode="wb", suffix=f".{ext}", delete=False) as tf:
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb", suffix=f".{ext}", delete=False
+                        ) as tf:
                             tf.write(raw_bytes)
                             tf.flush()
                             temp_path = tf.name
@@ -234,7 +284,9 @@ def register(mcp: FastMCP) -> None:
                         assert file_path is not None
                         ext = fnt._ext_for(file_path, None)
                         if ext not in ("pdf", "csv"):
-                            return _err(f"Unsupported file type {ext!r}; bring a PDF or CSV.")
+                            return _err(
+                                f"Unsupported file type {ext!r}; bring a PDF or CSV."
+                            )
                         temp_path = file_path
                         source = file_path
 
@@ -244,7 +296,9 @@ def register(mcp: FastMCP) -> None:
                         if raw_df.is_empty():
                             return _err("CSV file is empty.")
                     else:
-                        await ctx.report_progress(1, 3, "Extracting + normalizing invoice...")
+                        await ctx.report_progress(
+                            1, 3, "Extracting + normalizing invoice..."
+                        )
                         invalid = fnt._validate_pdf(temp_path)
                         if invalid:
                             return _err(invalid)
@@ -252,7 +306,9 @@ def register(mcp: FastMCP) -> None:
                         if extracted.is_empty():
                             return _err("PDF extraction returned no rows.")
                         # Normalize to FOCUS so we validate the real artifact.
-                        _plans, raw_df = await fnt._generate_and_normalize(extracted, "unknown")
+                        _plans, raw_df = await fnt._generate_and_normalize(
+                            extracted, "unknown"
+                        )
                 finally:
                     if temp_path and pdf_b64 and os.path.exists(temp_path):
                         try:
@@ -288,7 +344,9 @@ def register(mcp: FastMCP) -> None:
         # the caller explicitly passes a different ``billing_currency`` (deterministic
         # override — e.g. the LLM read "USD" from the invoice but the user says CAD).
         existing_currency = (
-            raw_df["BillingCurrency"].drop_nulls().first() if "BillingCurrency" in raw_df.columns else None
+            raw_df["BillingCurrency"].drop_nulls().first()
+            if "BillingCurrency" in raw_df.columns
+            else None
         )
         currency_missing = "BillingCurrency" in initial_missing
         caller_override = (
@@ -308,7 +366,9 @@ def register(mcp: FastMCP) -> None:
                         "value": value,
                         "source": "caller" if currency_value else "llm_inferred",
                         "reason": (
-                            "missing" if currency_missing else f"override {existing_currency} -> {currency_value}"
+                            "missing"
+                            if currency_missing
+                            else f"override {existing_currency} -> {currency_value}"
                         ),
                     }
                 )
@@ -331,11 +391,20 @@ def register(mcp: FastMCP) -> None:
             for r in repairs:
                 col = r["column"]
                 # The presence_<col> check passing is the proof the repair worked.
-                check = next((c for c in repaired_report.checks if c.rule_id == f"presence_{col}"), None)
+                check = next(
+                    (
+                        c
+                        for c in repaired_report.checks
+                        if c.rule_id == f"presence_{col}"
+                    ),
+                    None,
+                )
                 if check is not None and check.passed:
                     repairs_kept.append(r)
                 else:
-                    repairs_rolled_back.append({**r, "reason": "re-validation did not pass; reverted"})
+                    repairs_rolled_back.append(
+                        {**r, "reason": "re-validation did not pass; reverted"}
+                    )
             # All-or-nothing: only trust the repaired frame if everything verified.
             if repairs_kept and not repairs_rolled_back:
                 final_df = repaired_df
@@ -354,6 +423,21 @@ def register(mcp: FastMCP) -> None:
         final_failed = _failed_checks(final_report)
         final_compliant = not final_missing and not final_failed
 
+        # ── Optional: official FinOps validator on the FINAL (post-repair) frame ──
+        # Additive second opinion — an official-validator failure (env, crash) is
+        # reported explicitly, never silently dropped, and never fails the
+        # internal result.
+        official: dict[str, Any] | None = None
+        if official_validation:
+            from stitcher.assistant_harness.tools import (
+                focus_official_validation_tools as _fovt,
+            )
+
+            await ctx.report_progress(
+                3, 3, "Running official focus_validator (subprocess)..."
+            )
+            official = await _fovt.run_official_on_df(final_df)
+
         await ctx.report_progress(3, 3, "Done.")
 
         def _serialize(df: pl.DataFrame) -> dict[str, Any]:
@@ -367,10 +451,26 @@ def register(mcp: FastMCP) -> None:
                 "sample_rows": sample.to_dicts(),
             }
 
+        # ── User-visible artifact: the FINAL (post-repair) frame ────────
+        from .....common import artifacts
+
+        final_parquet = artifacts.persist_parquet(final_df, "validated", source, "FOCUS_PARQUET_OUTPUT_DIR", "stitcher-focus-parquet")
+
         return {
             "success": True,
             "compliant": final_compliant,
             "source": source,
+            "next_steps": (
+                [
+                    "To fix failing checks, use the custom_cost tools IN THIS ORDER: "
+                    "1) generate_focus_plans (correct the source→FOCUS mapping), "
+                    "2) simulate_normalize_config (verify the corrected config on raw data), "
+                    "3) save_focus_config (persist the updated normalize config as YAML), "
+                    "4) validate_focus_official(file_path=<normalized parquet>) (official conformance)."
+                ]
+                if not final_compliant
+                else None
+            ),
             "initial_validation_report": _report_to_dict(initial_report),
             "initial_compliant": initial_compliant,
             "repairs_applied": repairs,
@@ -382,5 +482,18 @@ def register(mcp: FastMCP) -> None:
             "failed_checks": final_failed,
             "llm_calls_made": any(r["source"] == "llm_inferred" for r in repairs),
             "normalized_df_summary": _serialize(final_df),
+            "final_parquet": final_parquet,
+            "official_validation": (
+                (official or {}).get("summary") if official else None
+            ),
+            "official_validation_compliant": (
+                official.get("compliant") if official else None
+            ),
+            "official_validation_report_path": (
+                official.get("report_path") if official else None
+            ),
+            "official_validation_error": (
+                official.get("error") if official and not official["success"] else None
+            ),
             "elapsed_seconds": _now() - t0,
         }

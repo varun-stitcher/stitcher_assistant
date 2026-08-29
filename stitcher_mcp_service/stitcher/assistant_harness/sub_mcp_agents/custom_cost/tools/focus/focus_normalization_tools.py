@@ -37,7 +37,7 @@ from typing import Any
 import polars as pl
 from fastmcp import Context, FastMCP
 
-from . import kw_cache
+from .. import kw_cache
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +252,7 @@ def register(mcp: FastMCP) -> None:
         use_cache: bool = True,
         validate: bool = True,
         max_sample_rows: int = 5,
+        official_validate: bool = False,
     ) -> dict[str, Any]:
         """Normalize any invoice to the FOCUS v1.2 column shape.
 
@@ -269,6 +270,13 @@ def register(mcp: FastMCP) -> None:
         optional FOCUS v1.2 spec validation. Returns the raw extraction summary,
         generated plans, normalized FOCUS DataFrame summary, and the validation
         report. Requires LLM API access (several LLM calls).
+
+        Both frames are ALSO persisted as user-visible parquet artifacts and their
+        paths are returned: ``raw_parquet`` (post-extract, pre-normalize) and
+        ``normalized_parquet`` (the FOCUS frame). The normalized parquet can be
+        passed straight to ``validate_focus_official(file_path=...)`` — no JSON
+        round-trip needed. Directory: ``$FOCUS_PARQUET_OUTPUT_DIR`` (default
+        ``<tmp>/stitcher-focus-parquet``).
 
         ``provider_name`` is an OPTIONAL hint and defaults to ``"auto"``. You do
         NOT need to supply it — for PDFs the extractor detects the provider
@@ -294,6 +302,11 @@ def register(mcp: FastMCP) -> None:
               and save each step's output to the KW cache for reuse.
             validate: When true (default), run the FOCUS v1.2 spec validator on the output.
             max_sample_rows: Max sample rows to include in each DataFrame summary (default 5).
+            official_validate: When true, ALSO run the official FinOps Foundation focus_validator
+              on the normalized frame (isolated subprocess, zero LLM) and return its report
+              under ``official_validation``. Strictly more thorough than the internal
+              validator; its failure is reported as ``official_validation_error`` without
+              failing the pipeline.
         """
         t0 = time.time()
 
@@ -355,6 +368,13 @@ def register(mcp: FastMCP) -> None:
                     return _err("PDF extraction returned no rows.")
 
             raw_summary = _serialize_df(raw_df, max_sample_rows)
+
+            # ── User-visible artifact: the RAW (pre-normalize) frame ─────
+            from .....common import artifacts
+
+            raw_parquet = artifacts.persist_parquet(
+                raw_df, "raw", source, "FOCUS_PARQUET_OUTPUT_DIR", "stitcher-focus-parquet"
+            )
 
             # Cache identity: file content + provider + column hint.
             variant = kw_cache.sha256_bytes(
@@ -418,6 +438,9 @@ def register(mcp: FastMCP) -> None:
             await ctx.report_progress(3, 4, "Normalized to FOCUS shape—validating...")
             normalized_summary = _serialize_df(normalized_df, max_sample_rows)
 
+            # ── User-visible artifact: the NORMALIZED FOCUS frame ────────
+            normalized_parquet = artifacts.persist_parquet(normalized_df, "normalized", source, "FOCUS_PARQUET_OUTPUT_DIR", "stitcher-focus-parquet")
+
             focus_found = [c for c in _EXPECTED_FOCUS_COLUMNS if c in normalized_df.columns]
             focus_missing = [c for c in _EXPECTED_FOCUS_COLUMNS if c not in normalized_df.columns]
 
@@ -425,6 +448,13 @@ def register(mcp: FastMCP) -> None:
             validation_report: dict[str, Any] | None = None
             if validate:
                 validation_report = _validate_focus(normalized_df, source=source)
+
+            # ── Stage 5 (optional): OFFICIAL FinOps focus_validator ─────
+            official: dict[str, Any] | None = None
+            if official_validate:
+                from stitcher.assistant_harness.tools import focus_official_validation_tools as _fovt
+
+                official = await _fovt.run_official_on_df(normalized_df)
             await ctx.report_progress(4, 4, "Done.")
 
             if use_cache:
@@ -438,6 +468,8 @@ def register(mcp: FastMCP) -> None:
                 "provider_hint": provider_name,
                 "source": source,
                 "raw_df_summary": raw_summary,
+                "raw_parquet": raw_parquet,
+                "normalized_parquet": normalized_parquet,
                 "plan_count": plan_count,
                 "plans_from_cache": plans_from_cache,
                 "plans": _serialize_plans(plans),
@@ -447,6 +479,9 @@ def register(mcp: FastMCP) -> None:
                 "focus_columns_found": focus_found,
                 "focus_columns_missing": focus_missing,
                 "validation_report": validation_report,
+                "official_validation": (official or {}).get("summary") if official else None,
+                "official_validation_compliant": official.get("compliant") if official else None,
+                "official_validation_error": official.get("error") if official and not official["success"] else None,
                 "elapsed_seconds": round(time.time() - t0, 2),
             }
         except Exception as e:  # noqa: BLE001

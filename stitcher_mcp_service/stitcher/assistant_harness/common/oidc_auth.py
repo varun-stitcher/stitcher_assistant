@@ -107,8 +107,20 @@ class _OIDCCallback(BaseHTTPRequestHandler):
 class OIDCAuth:
     """Holds all auth state + behavior in one place (no module globals)."""
 
-    def __init__(self, settings: StitcherAssistantConfig, state_dir: pathlib.Path) -> None:
+    @staticmethod
+    def default_state_dir() -> pathlib.Path:
+        """User-level auth state dir (NOT the package tree — tokens are runtime data).
+
+        ``~/.stitcher/`` — survives worktree switches, never lands in a wheel,
+        and all three servers (top-level + sub-MCPs) share one login.
+        """
+        d = pathlib.Path.home() / ".stitcher"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def __init__(self, settings: StitcherAssistantConfig, state_dir: pathlib.Path | None = None) -> None:
         self.s = settings
+        state_dir = state_dir or self.default_state_dir()
         self._token_file = state_dir / "stitcher_token.json"
         self._pending_file = state_dir / "stitcher_auth_pending.json"
         self._server: _CallbackServer | None = None

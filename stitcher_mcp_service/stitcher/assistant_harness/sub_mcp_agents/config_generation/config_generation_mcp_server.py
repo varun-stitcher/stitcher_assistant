@@ -33,7 +33,6 @@ Run over HTTP (run.sh):   ... --http 8793
 from __future__ import annotations
 
 import argparse
-import pathlib
 
 from fastmcp import FastMCP
 
@@ -63,7 +62,7 @@ def build_server() -> FastMCP:
 
     # Share the top-level assistant_harness/ state dir so the OIDC token the agent mints via the
     # top-level `auth_get_url` is reused here (one login, both servers).
-    state_dir = pathlib.Path(__file__).resolve().parents[2]  # .../assistant_harness/
+    state_dir = OIDCAuth.default_state_dir()  # ~/.stitcher/ (user-level, shared login)
     auth = OIDCAuth(settings, state_dir)
     client = StitcherClient(settings, auth)
     soe = build_soe_context(settings, auth, client)

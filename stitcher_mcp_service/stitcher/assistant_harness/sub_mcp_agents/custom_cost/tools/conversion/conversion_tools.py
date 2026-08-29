@@ -57,7 +57,9 @@ def _serialize_df(df: pl.DataFrame, max_rows: int = 5) -> dict[str, Any]:
     return {
         "shape": {"rows": df.height, "columns": df.width},
         "columns": df.columns,
-        "schema": {col: str(dtype) for col, dtype in zip(df.columns, df.dtypes, strict=True)},
+        "schema": {
+            col: str(dtype) for col, dtype in zip(df.columns, df.dtypes, strict=True)
+        },
         "sample_rows": sample.to_dicts(),
     }
 
@@ -71,7 +73,9 @@ def _load_data(path: str) -> pl.DataFrame:
         return pl.read_csv(path)
     if ext in ("parquet", "parq"):
         return pl.read_parquet(path)
-    raise ValueError(f"unsupported data type '{ext}' (bring a .csv or .parquet): {path}")
+    raise ValueError(
+        f"unsupported data type '{ext}' (bring a .csv or .parquet): {path}"
+    )
 
 
 def register(mcp: FastMCP) -> None:
@@ -88,7 +92,9 @@ def register(mcp: FastMCP) -> None:
         from focus_converter.converter import BASE_CONVERSION_CONFIGS
 
         try:
-            providers = sorted(p for p in os.listdir(BASE_CONVERSION_CONFIGS) if not p.startswith("."))
+            providers = sorted(
+                p for p in os.listdir(BASE_CONVERSION_CONFIGS) if not p.startswith(".")
+            )
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": f"could not list provider configs: {e}"}
         return {"success": True, "providers": providers, "count": len(providers)}
@@ -107,7 +113,11 @@ def register(mcp: FastMCP) -> None:
         t0 = time.time()
 
         def _err(message: str) -> dict[str, Any]:
-            return {"success": False, "error": message, "elapsed_seconds": round(time.time() - t0, 2)}
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
 
         if not os.path.isfile(file_path):
             return _err(f"no such file: {file_path}")
@@ -116,7 +126,9 @@ def register(mcp: FastMCP) -> None:
             sensor.load()
         except Exception as e:  # noqa: BLE001
             logger.exception("detect_provider failed")
-            return _err(f"provider detection failed: {type(e).__name__}: {str(e)[:500]}")
+            return _err(
+                f"provider detection failed: {type(e).__name__}: {str(e)[:500]}"
+            )
         return {
             "success": True,
             "provider": sensor.provider,
@@ -139,7 +151,11 @@ def register(mcp: FastMCP) -> None:
         t0 = time.time()
 
         def _err(message: str) -> dict[str, Any]:
-            return {"success": False, "error": message, "elapsed_seconds": round(time.time() - t0, 2)}
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
 
         provider_base = os.path.join(BASE_CONVERSION_CONFIGS, provider)
         if not os.path.isdir(provider_base):
@@ -150,7 +166,9 @@ def register(mcp: FastMCP) -> None:
             plans = converter.plans.get(provider, [])
         except Exception as e:  # noqa: BLE001
             logger.exception("load_provider_plans failed")
-            return _err(f"failed to load plans for {provider!r}: {type(e).__name__}: {str(e)[:500]}")
+            return _err(
+                f"failed to load plans for {provider!r}: {type(e).__name__}: {str(e)[:500]}"
+            )
         return {
             "success": True,
             "provider": provider,
@@ -187,18 +205,26 @@ def register(mcp: FastMCP) -> None:
         t0 = time.time()
 
         def _err(message: str) -> dict[str, Any]:
-            return {"success": False, "error": message, "elapsed_seconds": round(time.time() - t0, 2)}
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
 
         try:
             plan_dicts = json.loads(plans_json)
         except json.JSONDecodeError as e:
             return _err(f"plans_json is not valid JSON: {e}")
         if not isinstance(plan_dicts, list) or not plan_dicts:
-            return _err("plans_json must be a non-empty JSON array of ConversionPlan objects.")
+            return _err(
+                "plans_json must be a non-empty JSON array of ConversionPlan objects."
+            )
         try:
             plans = [ConversionPlan.model_validate(p) for p in plan_dicts]
         except Exception as e:  # noqa: BLE001
-            return _err(f"could not build ConversionPlan list: {type(e).__name__}: {str(e)[:500]}")
+            return _err(
+                f"could not build ConversionPlan list: {type(e).__name__}: {str(e)[:500]}"
+            )
         try:
             raw_df = _load_data(data_path)
         except Exception as e:  # noqa: BLE001
@@ -246,18 +272,26 @@ def register(mcp: FastMCP) -> None:
         t0 = time.time()
 
         def _err(message: str) -> dict[str, Any]:
-            return {"success": False, "error": message, "elapsed_seconds": round(time.time() - t0, 2)}
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
 
         try:
             cfg_dict = json.loads(config_json)
         except json.JSONDecodeError as e:
             return _err(f"config_json is not valid JSON: {e}")
         if not isinstance(cfg_dict, dict) or not cfg_dict:
-            return _err("config_json must be a non-empty JSON object (InlineNormalizeDatasourceDto).")
+            return _err(
+                "config_json must be a non-empty JSON object (InlineNormalizeDatasourceDto)."
+            )
         try:
             config = InlineNormalizeDatasourceDto.model_validate(cfg_dict)
         except Exception as e:  # noqa: BLE001
-            return _err(f"could not build InlineNormalizeDatasourceDto: {type(e).__name__}: {str(e)[:500]}")
+            return _err(
+                f"could not build InlineNormalizeDatasourceDto: {type(e).__name__}: {str(e)[:500]}"
+            )
         try:
             raw_df = _load_data(data_path)
         except Exception as e:  # noqa: BLE001
@@ -265,9 +299,13 @@ def register(mcp: FastMCP) -> None:
         if raw_df.is_empty():
             return _err("data file is empty.")
         try:
-            focus_df = InlineNormalizeDatasourceDto.simulate_conversion_plan(raw_df=raw_df, response_configs=config)
+            focus_df = InlineNormalizeDatasourceDto.simulate_conversion_plan(
+                raw_df=raw_df, response_configs=config
+            )
         except Exception as e:  # noqa: BLE001
-            logger.exception("simulate_normalize_config: simulate_conversion_plan failed")
+            logger.exception(
+                "simulate_normalize_config: simulate_conversion_plan failed"
+            )
             return _err(f"conversion failed: {type(e).__name__}: {str(e)[:500]}")
         return {
             "success": True,
@@ -294,12 +332,18 @@ def register(mcp: FastMCP) -> None:
             config_dir: directory holding normalize stage YAML files (e.g. an
               environment repo's ``build/normalize/`` directory).
         """
-        from stitcher.pipeline.common.config_loaders.normalize_config_loader import NormalizeConfigLoader
+        from stitcher.pipeline.common.config_loaders.normalize_config_loader import (
+            NormalizeConfigLoader,
+        )
 
         t0 = time.time()
 
         def _err(message: str) -> dict[str, Any]:
-            return {"success": False, "error": message, "elapsed_seconds": round(time.time() - t0, 2)}
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
 
         if not os.path.isdir(config_dir):
             return _err(f"no such directory: {config_dir}")
@@ -311,7 +355,9 @@ def register(mcp: FastMCP) -> None:
             return _err(f"config load failed: {type(e).__name__}: {str(e)[:500]}")
         files = sorted(p.name for p in loader.__list_dir__())
         if not configs:
-            return _err(f"loaded 0 valid configs from {config_dir} (files: {files or 'none'}).")
+            return _err(
+                f"loaded 0 valid configs from {config_dir} (files: {files or 'none'})."
+            )
         serialized: list[dict[str, Any]] = []
         for cfg in configs:
             for ds in cfg.data_source_normalizers:
@@ -330,3 +376,109 @@ def register(mcp: FastMCP) -> None:
             "normalizers": serialized,
             "elapsed_seconds": round(time.time() - t0, 2),
         }
+
+    # ---- save_focus_config: closes the 'update normalize configs' loop ----
+    @mcp.tool
+    def save_focus_config(
+        config_json: dict[str, Any], name: str | None = None
+    ) -> dict[str, Any]:
+        """Persist an updated FOCUS normalize config as a user-visible YAML artifact.
+
+        Closes the loop for "make the fix and update normalize configs": after the
+        agent corrects a plan (e.g. via ``generate_focus_plans`` output, or by editing
+        a config from ``load_normalize_configs``), THIS tool saves it as a
+        NormalizeConfigModelV1 YAML file the workflow can reuse
+        (``load_normalize_configs`` → ``simulate_normalize_config`` re-verifies it
+        against raw data — zero LLM).
+
+        Refuses by construction: the config is validated through the SAME
+        ``InlineNormalizeDatasourceDto`` model the pipeline uses — an invalid or
+        empty config is never written. A verification re-parse (write → load →
+        compare) must pass, otherwise the write is reported as failed.
+
+        Args:
+            config_json: InlineNormalizeDatasourceDto JSON (e.g. from
+              ``normalize_to_focus``'s ``plans[0].config``, ``simulate_normalize_config``
+              round-trip, or a hand-corrected variant).
+            name: optional file stem (default: the converter_plan_name).
+        """
+        t0 = time.time()
+
+        def _err(message: str) -> dict[str, Any]:
+            return {
+                "success": False,
+                "error": message,
+                "elapsed_seconds": round(time.time() - t0, 2),
+            }
+
+        if not isinstance(config_json, dict) or not config_json:
+            return _err(
+                "config_json must be a non-empty JSON object (InlineNormalizeDatasourceDto)."
+            )
+        try:
+            from stitcher.pipeline.common.config_loaders.normalize_config_loader import (
+                NormalizeConfigLoader,
+            )
+            from stitcher.pipeline.common.pipeline_config_models.versions.v1_alpha.normalize.normalize_config import (
+                InlineNormalizeDatasourceDto,
+            )
+
+            dto = InlineNormalizeDatasourceDto.model_validate(config_json)
+        except Exception as e:  # noqa: BLE001
+            return _err(
+                f"could not validate config as InlineNormalizeDatasourceDto: {type(e).__name__}: {str(e)[:500]}"
+            )
+
+        from ...common import artifacts
+
+        out_dir = artifacts.user_output_dir("FOCUS_CONFIG_OUTPUT_DIR", "stitcher-focus-configs")
+        try:
+            stem = (name or dto.converter_plan_name or "focus-config").replace(
+                " ", "_"
+            )[:80]
+            path = out_dir / f"{stem}.yaml"
+            path.write_text(
+                _yaml_dump({"data_source_normalizers": [dto.model_dump(mode="json")]})
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("save_focus_config write failed")
+            return _err(f"failed to write config: {type(e).__name__}: {str(e)[:500]}")
+
+        # Verify: the saved YAML must round-trip through the PRODUCTION loader.
+        try:
+            loader = NormalizeConfigLoader(base_dir=str(out_dir))
+            loaded = loader.load_configs()
+            match = any(
+                ds.converter_plan_name == dto.converter_plan_name
+                for cfg in loaded
+                for ds in cfg.data_source_normalizers
+            )
+            if not match:
+                return _err(
+                    f"saved YAML did not verify via NormalizeConfigLoader (wrote {path})."
+                )
+        except Exception as e:  # noqa: BLE001
+            return _err(
+                f"saved YAML failed verification load: {type(e).__name__}: {str(e)[:500]}"
+            )
+
+        return {
+            "success": True,
+            "config_path": str(path),
+            "converter_plan_name": dto.converter_plan_name,
+            "focus_column_count": len(dto.focus_columns),
+            "output_dir": str(out_dir),
+            "next_steps": (
+                "verify with simulate_normalize_config(config_json=...) against the raw data, then "
+                "re-validate with validate_focus_official(file_path=<normalized parquet>)"
+            ),
+            "elapsed_seconds": round(time.time() - t0, 2),
+        }
+
+
+def _yaml_dump(obj: dict[str, Any]) -> str:
+    import yaml
+
+    return yaml.safe_dump(
+        obj, sort_keys=False, default_flow_style=False, allow_unicode=True
+    )

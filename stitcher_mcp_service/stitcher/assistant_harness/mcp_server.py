@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import pathlib
 from contextlib import AsyncExitStack, asynccontextmanager
 
 import uvicorn
@@ -59,6 +58,7 @@ from .tools import (
     committed_config_tools,
     data_source_tools,
     file_tools,
+    focus_official_validation_tools,
     result_capture,
     stitcher_tools,
 )
@@ -73,7 +73,7 @@ def build_server() -> FastMCP:
     # SPC LLM config (honoring an explicit USE_STITCHER_MODEL=false).
     settings.export_llm_env()
 
-    auth = OIDCAuth(settings, pathlib.Path(__file__).resolve().parent)
+    auth = OIDCAuth(settings)
     client = StitcherClient(settings, auth)
     soe = build_soe_context(settings, auth, client)
     mcp = FastMCP(name="stitcher-pi-tools")
@@ -85,7 +85,12 @@ def build_server() -> FastMCP:
     # derived columns. Both exercise SOE functions as-is via `soe`.
     data_source_tools.register(mcp, client, soe)
     committed_config_tools.register(mcp, client, soe)
-    # The agent gateway (gateway.py) drives a headless pi turn per orchestrator call and the
+    # Official FinOps Foundation focus_validator (isolated subprocess → local
+    # focus_validator_local clone + venv). Deliberately on the TOP-LEVEL MCP: unlike the
+    # sub-MCP bundles it is cheap to run (no SOE scope needed) and is a general-purpose
+    # "is this dataset FOCUS-conformant" check any caller may want early in a conversation.
+    focus_official_validation_tools.register(mcp)
+    # The agent gateway (agent_gateway/gateway.py) drives a headless pi turn per orchestrator call and the
     # agent submits the structured result through this tool. Gated so the interactive run.sh
     # agent (flag unset) never sees `submit_result` in its tool list.
     if os.environ.get("STITCHER_ENABLE_RESULT_CAPTURE") == "1":

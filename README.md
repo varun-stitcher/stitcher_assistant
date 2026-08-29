@@ -55,7 +55,7 @@ The pi agent (`pi_coding_agent/`) can be exposed as an orchestrator behind two s
 Claude Code / Claude Desktop and OpenAI-compatible clients can drive it: a **higher-order MCP
 server** (task-typed tools — `generate_enhance_config`, `normalize_invoice_to_focus`,
 `explore_environment`) and an **OpenAI-compatible endpoint** (`/v1/chat/completions`). Both are
-served by one gateway process (`stitcher_mcp_service/stitcher/assistant_harness/gateway.py`)
+served by one gateway process (`stitcher_mcp_service/stitcher/assistant_harness/agent_gateway/gateway.py`) — see `docs/harness/README.md` for the module map and workflows
 that shares a single `AgentRunner` (per-call headless pi turns, per-call scoped tool MCP).
 
 ```bash

@@ -36,8 +36,8 @@ from typing import Any
 import polars as pl
 from fastmcp import Context, FastMCP
 
-from . import kw_cache
-from .focus_normalization_tools import _serialize_df, _validate_pdf
+from .. import kw_cache
+from ..focus.focus_normalization_tools import _serialize_df, _validate_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ def register(mcp: FastMCP) -> None:
                 if invalid:
                     return _err(invalid)
                 await ctx.report_progress(1, 1, "Extracting rows from invoice (PDF OCR)...")
-                from .focus_normalization_tools import _extract_raw_df
+                from ..focus.focus_normalization_tools import _extract_raw_df
 
                 raw_df, detected_provider = await _extract_raw_df(pdf_path, expected_columns=expected_columns)
                 if not detected_provider:

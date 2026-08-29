@@ -41,13 +41,11 @@ import argparse
 from fastmcp import FastMCP
 
 from ...common.config import StitcherAssistantConfig
-from .tools import (
-    conversion_tools,
-    extract_tools,
-    focus_normalization_tools,
-    focus_validation_tools,
-    plan_generation_tools,
-)
+from ...tools import focus_official_validation_tools
+from .tools.conversion import conversion_tools
+from .tools.extraction import extract_tools
+from .tools.focus import focus_normalization_tools, focus_validation_tools
+from .tools.plan import plan_generation_tools
 
 # Server name advertised over MCP. The pi extension keys sub-MCP activation off
 # the ``STITCHER_SUB_MCP_URLS`` registry (name -> URL), not off this name, but
@@ -67,6 +65,10 @@ def build_server() -> FastMCP:
     focus_normalization_tools.register(mcp)
     focus_validation_tools.register(mcp)
     plan_generation_tools.register(mcp)
+    # Official FinOps focus_validator — same module the top-level MCP serves, also
+    # registered here so the custom_cost bundle is self-contained (an agent that
+    # activated only this sub-MCP still gets the standalone official-validation tool).
+    focus_official_validation_tools.register(mcp)
     return mcp
 
 

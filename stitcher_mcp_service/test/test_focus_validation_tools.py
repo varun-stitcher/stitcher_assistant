@@ -22,7 +22,7 @@ import json
 
 import polars as pl
 
-from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools import focus_validation_tools as fvt
+from stitcher.assistant_harness.sub_mcp_agents.custom_cost.tools.focus import focus_validation_tools as fvt
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
