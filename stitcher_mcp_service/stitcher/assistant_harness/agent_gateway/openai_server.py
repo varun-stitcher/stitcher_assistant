@@ -1,4 +1,4 @@
-"""OpenAI-compatible endpoint for the stitcher pi agent, served by the agent gateway.
+"""OpenAI-compatible endpoint for the stitcher pi agent, served by the agent gateway (agent_gateway/gateway.py).
 
 `POST /v1/chat/completions` drives one headless pi turn (sharing the gateway's `AgentRunner`) and
 returns an OpenAI-shaped completion. Per-call env scope arrives on the non-standard ``stitcher``

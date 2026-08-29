@@ -52,7 +52,7 @@ command -v pi >/dev/null 2>&1 || { echo "!! 'pi' CLI not on PATH (npm i -g @eare
 export PYTHONPATH="$REPO_ROOT/stitcher_mcp_service${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "stitcher-pi gateway — MCP http://127.0.0.1:${MCP_PORT}/mcp/  OpenAI http://127.0.0.1:${OAI_PORT}/v1  model ${STITCHER_MODEL_NAME}"
-"$PY" -m stitcher.assistant_harness.gateway --mcp-port "$MCP_PORT" --openai-port "$OAI_PORT" > /tmp/stitcher-pi-gateway.log 2>&1 &
+"$PY" -m stitcher.assistant_harness.agent_gateway.gateway --mcp-port "$MCP_PORT" --openai-port "$OAI_PORT" > /tmp/stitcher-pi-gateway.log 2>&1 &
 GW_PID=$!
 trap 'kill "$GW_PID" 2>/dev/null || true' EXIT
 

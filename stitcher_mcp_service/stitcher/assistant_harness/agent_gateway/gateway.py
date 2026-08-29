@@ -12,7 +12,7 @@ orchestrator call spawns its own ephemeral-port tool MCP + pi subprocess, so the
 concurrency-safe and per-call env-scoped.
 
 Run:
-    python -m stitcher.assistant_harness.gateway --mcp-port 8792 --openai-port 8880
+    python -m stitcher.assistant_harness.agent_gateway.gateway --mcp-port 8792 --openai-port 8880
 """
 
 from __future__ import annotations

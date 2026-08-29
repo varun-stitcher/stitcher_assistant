@@ -388,7 +388,7 @@ GW_MCP_URL=http://127.0.0.1:8792/mcp/ node ../gateway_mcp_smoke.mjs list
 GW_MCP_URL=http://127.0.0.1:8792/mcp/ node ../gateway_mcp_smoke.mjs explore_environment
 ```
 
-Shared code lives in `stitcher_mcp_service/stitcher/assistant_harness/`: `agent_runner.py` (the
+Shared code lives in `stitcher_mcp_service/stitcher/assistant_harness/agent_gateway/`: `agent_runner.py` (the
 headless pi driver), `agent_mcp_server.py` (the task-typed tools), `openai_server.py` (the OpenAI
-router), `gateway.py` (the two-surface server), and `tools/result_capture.py` (the gated
-`submit_result` tool). 
+router), `gateway.py` (the two-surface server), and `gateway_chat.html` (the demo chat UI); the gated
+`submit_result` tool remains in `tools/result_capture.py`. 

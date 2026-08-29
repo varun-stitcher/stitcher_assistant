@@ -15,7 +15,7 @@ Env scope is **per-call** (every tool takes ``environment_id`` + ``pipeline_name
 generation is environment-scoped and refuses without them. ``normalize_invoice_to_focus`` is
 env-agnostic (the custom_cost sub-MCP) so its scope args are optional but accepted for consistency.
 
-Run (served by the gateway, not standalone): ``python -m stitcher.assistant_harness.gateway``.
+Run (served by the gateway, not standalone): ``python -m stitcher.assistant_harness.agent_gateway.gateway``.
 """
 
 from __future__ import annotations

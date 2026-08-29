@@ -1,6 +1,6 @@
 """AgentRunner — drive one headless pi turn per orchestrator call (the gateway's core).
 
-The agent gateway (`gateway.py`) exposes the stitcher pi agent as a higher-order MCP server
+The agent gateway (`agent_gateway/gateway.py`) exposes the stitcher pi agent as a higher-order MCP server
 (Claude Code / Claude Desktop) and an OpenAI-compatible endpoint. Both surfaces share this
 runner. Per call it:
 
@@ -45,8 +45,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ── paths (anchored to this module so the runner is CWD-independent) ──────────────────────────
-_PKG = pathlib.Path(__file__).resolve().parent  # .../assistant_harness/
-_MCP_SERVICE = _PKG.parent.parent  # .../stitcher_mcp_service/
+_PKG = pathlib.Path(__file__).resolve().parent  # .../assistant_harness/agent_gateway/
+_MCP_SERVICE = _PKG.parent.parent.parent  # .../stitcher_mcp_service/
 ASSISTANT_ROOT = _MCP_SERVICE.parent  # .../stitcher_assistant/
 PIA_DIR = ASSISTANT_ROOT / "pi_coding_agent"  # home of the pi extension + .env.local symlinks
 EXT = PIA_DIR / "pi_extension" / "index.ts"

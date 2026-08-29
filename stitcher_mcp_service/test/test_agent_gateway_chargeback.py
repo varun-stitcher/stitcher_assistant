@@ -19,10 +19,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from stitcher.assistant_harness import agent_runner, openai_server
-from stitcher.assistant_harness.agent_mcp_server import build_server
-from stitcher.assistant_harness.agent_runner import AgentResult
-from stitcher.assistant_harness.openai_server import _extract_scope, _terminal_ui
+from stitcher.assistant_harness.agent_gateway import agent_runner, openai_server
+from stitcher.assistant_harness.agent_gateway.agent_mcp_server import build_server
+from stitcher.assistant_harness.agent_gateway.agent_runner import AgentResult
+from stitcher.assistant_harness.agent_gateway.openai_server import _extract_scope, _terminal_ui
 
 # ── pure mappings ────────────────────────────────────────────────────────────────────────────
 
