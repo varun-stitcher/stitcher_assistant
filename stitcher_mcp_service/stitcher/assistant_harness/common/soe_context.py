@@ -16,12 +16,12 @@ fallback to ``STITCHER_ENVIRONMENT_ID`` / ``STITCHER_PIPELINE_ID`` / ``STITCHER_
 ``STITCHER_AUTH_TENANT``). ``pipeline_id`` is resolved lazily from the pipeline name via ``StitcherClient``
 when missing.
 """
+
 from __future__ import annotations
 
 import logging
 import pathlib
 import uuid
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _OUTPUT_DIR = pathlib.Path(__file__).resolve().parents[4] / "pi_coding_agent" / ".output"
 
 # ── SOE env tuple (environment_id, pipeline_id, branch, auth_tenant) ──────────
+
 
 class SoeContext:
     """Holds the SOE scope + lazily-built ``WorkflowContext`` for the sub-MCP tools.
@@ -46,7 +47,7 @@ class SoeContext:
         self.client = client
         ctx = settings.env_context  # SAI_ENV_CONTEXT JSON, parsed by StitcherAssistantConfig
         self.environment_id: str = str(ctx.get("environment_id") or settings.environment_id or "")
-        self.pipeline_id: Optional[str] = str(ctx.get("pipeline_id") or settings.pipeline_id or "")
+        self.pipeline_id: str | None = str(ctx.get("pipeline_id") or settings.pipeline_id or "")
         self.pipeline_name: str = str(ctx.get("pipeline_name") or settings.pipeline_name or "")
         self.branch: str = str(ctx.get("branch") or settings.git_branch or "main")
         self.auth_tenant: str = str(ctx.get("auth_tenant") or settings.auth_tenant or "")
@@ -95,7 +96,7 @@ class SoeContext:
 
     # ── lazy pipeline_id resolution ────────────────────────────────────────────
 
-    def resolve_pipeline_id(self) -> Optional[str]:
+    def resolve_pipeline_id(self) -> str | None:
         """Resolve the pipeline UUID from the pipeline name via ``StitcherClient`` when missing.
         Cached after the first success. Best-effort (returns None on failure); records the reason in
         ``self.pipeline_resolve_error`` so the caller can surface a diagnostic instead of a bare None."""
@@ -178,7 +179,106 @@ class SoeContext:
 
     # ── committed-config git fetch (shared by any agent needing the committed state) ──────────
 
-    async def fetch_committed_configs(self, branch: str = "") -> tuple[Optional[dict], str]:
+    def _pipelines_in_env_hint(self) -> str:
+        """Best-effort list of the pipelines that DO exist in this environment, for a 404 hint.
+        Uses the SAME SOE service-account token path as the fetch itself (the harness browser-
+        OIDC token may not be present, and the diagnostic must not depend on it). Never raises —
+        a failed lookup just means no hint — deterministic, no fabrication."""
+        try:
+            import uuid as _uuid
+
+            from stitcher.operation_executor.common.vcs_repo import WebserviceIntegration
+
+            token = WebserviceIntegration.get_token(
+                auth_tenant=self.auth_tenant, environment_id=_uuid.UUID(self.environment_id)
+            )
+            from stitcher.assistant_harness.common.config import StitcherAssistantConfig
+            from stitcher.webservice.client import ApiClient, Configuration
+            from stitcher.webservice.client.api.pipeline_api import PipelineApi
+
+            host = StitcherAssistantConfig().api_url
+            conf = Configuration(host=host, access_token=token)
+            if verify := self.auth._http_verify():
+                if verify is not True:
+                    conf.ssl_ca_cert = str(verify)
+            else:
+                conf.verify_ssl = False
+                conf.assert_hostname = False
+            with ApiClient(conf) as client:
+                api = PipelineApi(client)
+                resp = api.list_pipelines(environment=self.environment_id)
+            objs = getattr(resp, "objects", None) or []
+            rows = [f"  - {getattr(p, 'name', '?')}: {getattr(p, 'id', '?')}" for p in objs if getattr(p, "id", None)]
+            if rows:
+                return "Pipelines that exist in this environment:\n" + "\n".join(rows[:10])
+        except Exception:  # noqa: BLE001 — hint only, never a new failure
+            pass
+        return ""
+
+    def _diagnose_vcs_error(self, e: Exception, pipeline_id: str) -> str:
+        """Turn a raw committed-config-fetch exception into an actionable message for the
+        OPERATOR (never a traceback to the agent). Classifies the known credential/infra
+        failures at each layer of the chain: Keycloak → SWS pipeline lookup → Vault
+        installation id → GitHub App key → GitHub token exchange → repo clone."""
+        type_name = type(e).__name__
+        msg = str(e)
+
+        # ── GitHub App private key missing (FileNotFoundError from open(...pem)) ─
+        if type_name == "FileNotFoundError" or ("No such file or directory" in msg and ".pem" in msg):
+            return (
+                "ERR: GitHub App private key not found — the committed-config read cannot "
+                "authenticate to the pipeline's config repository.\n"
+                f"  raw error: {msg[:200]}\n"
+                "  Fix: place the stitcherai-dev GitHub App private key at the path configured by "
+                "GITHUB_PRIVATE_KEY_PATH in pi_coding_agent/.env.local.dev "
+                "(default ../local/github/gh_app_key.pem), then retry."
+            )
+
+        # ── SWS pipeline not found (404) — include which pipelines DO exist ─────
+        if type_name == "NotFoundException" or ("404" in msg and "pipeline" in msg.lower()):
+            hint = self._pipelines_in_env_hint()
+            return (
+                f"ERR: SWS returned 404 — no pipeline with id {pipeline_id} exists in environment "
+                f"{self.environment_id} (note: SWS itself IS reachable — this is a scope/config "
+                "mismatch, not an outage).\n"
+                + (hint + "\n" if hint else "")
+                + "  Fix: set STITCHER_PIPELINE_ID (or STITCHER_PIPELINE_NAME) to one of the "
+                "pipelines above in run.local.sh / the gateway call scope."
+            )
+
+        # ── SWS / Keycloak auth failures (401/403) ─────────────────────────────
+        if type_name in ("UnauthorizedException", "ForbiddenException") or "401" in msg or "403" in msg:
+            return (
+                f"ERR: authentication failed for the committed-config read ({type_name}: {msg[:150]}).\n"
+                f"  Fix: check STITCHER_AUTH_TENANT (currently: {self.auth_tenant or 'UNSET'}) — the "
+                "service account must exist in that Keycloak realm with access to this environment. "
+                "Also verify STITCHER_API_TOKEN / STITCHER_MODEL_API_KEY are current."
+            )
+
+        # ── Vault: installation id lookup failed ────────────────────────────────
+        if "installation" in msg.lower() or "vault" in msg.lower():
+            return (
+                f"ERR: could not resolve the GitHub App installation for pipeline {pipeline_id} "
+                f"({msg[:200]}).\n"
+                "  Fix: confirm the stitcherai-dev GitHub App is installed on the pipeline's config "
+                "repository and the installation id is stored in Vault for this environment."
+            )
+
+        # ── Unreachable service (connection refused / DNS / TLS) ────────────────
+        if any(
+            k in msg.lower()
+            for k in ("connection refused", "name or service not known", "name resolution", "timed out", "ssl")
+        ):
+            return (
+                f"ERR: a service needed for the committed-config read is unreachable ({msg[:200]}).\n"
+                "  Fix: check that the local stack is up (docker/start_services.sh) and that "
+                "SWS_URL / Keycloak URLs in .env.local are reachable from this machine."
+            )
+
+        # ── fallback: keep the raw message (never a fabricated success) ─────────
+        return f"ERR fetching committed config from git: {msg[:250]}"
+
+    async def fetch_committed_configs(self, branch: str = "") -> tuple[dict | None, str]:
         """Fetch the LATEST COMMITTED pipeline configs from the git branch for this environment's
         pipeline via the SOE git integration (``get_vsc_commit_dir``). Enforces the SOE read
         preconditions (scoped, tenant, pipeline_id) and returns ``(pipeline_configs, error_msg)`` —
@@ -208,7 +308,7 @@ class SoeContext:
                 git_branch=branch or self.branch or "main",
             )
         except Exception as e:  # noqa: BLE001
-            return None, f"ERR fetching committed config from git: {str(e)[:250]}"
+            return None, self._diagnose_vcs_error(e, pipeline_id)
         return result.get("pipeline_configs"), ""
 
     # ── summary for the environment_context tool ──────────────────────────────
