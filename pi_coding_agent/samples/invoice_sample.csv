@@ -1,0 +1,2 @@
+Item,Price,ChargeType,Invoice Number,Invoice Date,Currency,ProviderName,ServiceCategory
+Web,10250.00,Usage,Sample Invoice,2025-06-19,USD,Sample Invoice,Usage

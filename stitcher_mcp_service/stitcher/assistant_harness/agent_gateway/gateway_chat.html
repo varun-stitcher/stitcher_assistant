@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitcher Agent Gateway — chat</title>
+<style>
+  :root { --bg:#0f1117; --panel:#181b23; --line:#262a35; --fg:#e6e8ee; --dim:#8b90a0;
+          --accent:#4f8cff; --ok:#3fbf7f; --chip:#232838; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px;
+           align-items:center; flex-wrap:wrap; background:var(--panel); }
+  header h1 { font-size:14px; margin:0 8px 0 0; font-weight:600; }
+  header .scope { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  header input { background:#0d0f15; color:var(--fg); border:1px solid var(--line);
+                 border-radius:6px; padding:4px 8px; font-size:11px; width:250px; }
+  header label { font-size:10px; color:var(--dim); }
+  #chat { flex:1; overflow-y:auto; padding:16px 16px 8px; }
+  .row { display:flex; margin:6px 0; }
+  .row.me { justify-content:flex-end; }
+  .bubble { max-width:78%; padding:8px 12px; border-radius:10px; line-height:1.45; font-size:13px; }
+  .user .bubble { background:var(--accent); color:#fff; border-bottom-right-radius:3px; }
+  .bot .bubble  { background:var(--panel); border:1px solid var(--line); border-bottom-left-radius:3px; }
+  .progress { font-size:11px; color:var(--dim); font-family:ui-monospace,monospace; padding:1px 0 1px 14px; }
+  .progress b { color:var(--ok); font-weight:500; }
+  .artifact { border:1px solid #2c3a5c; background:#141a2a; border-radius:10px; padding:10px 12px;
+              margin:6px 0; max-width:100%; overflow-x:auto; }
+  .artifact-head { display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
+  .chip { font-size:10px; padding:2px 8px; border-radius:10px; background:#1d2a45; color:#9db9ff;
+          border:1px solid #2c3a5c; }
+  .chip.k { background:#17301f; color:#7fe0a2; border-color:#2c5c3f; }
+  table { border-collapse:collapse; margin:6px 0; font-size:12px; }
+  th,td { border:1px solid var(--line); padding:3px 8px; text-align:left; }
+  th { background:#20242f; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  code { background:#0d0f15; padding:1px 5px; border-radius:4px; font-size:12px; }
+  pre { background:#0d0f15; padding:8px; border-radius:8px; overflow-x:auto; font-size:12px; }
+  h1,h2,h3 { font-size:14px; margin:8px 0 4px; }
+  footer { padding:10px 16px; border-top:1px solid var(--line); display:flex; gap:8px; background:var(--panel); }
+  #msg { flex:1; background:#0d0f15; color:var(--fg); border:1px solid var(--line);
+         border-radius:8px; padding:9px 12px; font-size:13px; outline:none; }
+  #send { background:var(--accent); border:none; color:#fff; border-radius:8px; padding:0 18px;
+          cursor:pointer; font-size:13px; }
+  #send:disabled { opacity:.4; cursor:default; }
+  .hint { color:var(--dim); font-size:11px; padding:0 16px 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Stitcher Agent Gateway</h1>
+  <div class="scope">
+    <label>env</label><input id="env" placeholder="environment_id">
+    <label>pipeline</label><input id="pipe" value="finops">
+    <label>tenant</label><input id="tenant" placeholder="auth_tenant">
+  </div>
+</header>
+<div id="chat"></div>
+<footer>
+  <input id="msg" placeholder="e.g. Prepare the July 2026 chargeback report · or: cost by cost center and service"
+         autocomplete="off">
+  <button id="send">Send</button>
+</footer>
+<div class="hint" style="padding-left:16px">Scope is sent per turn on the <code>stitcher</code> extension — nothing env-scoped at boot.</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const chat = $("chat");
+// Defaults = the local simulated env; persisted so a page reload keeps your scope.
+const DEF = { env: "aac8c9ec-a865-4e3b-c1f8-00155dcea122", pipe: "finops", tenant: "stitcherai-wsmo5" };
+for (const [id, key] of [["env", "env"], ["pipe", "pipe"], ["tenant", "tenant"]]) {
+  $(id).value = localStorage.getItem("cb-" + id) || DEF[key];
+  $(id).addEventListener("change", () => localStorage.setItem("cb-" + id, $(id).value));
+}
+const history = [];  // {role, content} — the gateway is stateless per call; we thread the turns.
+
+function add(el, cls) { const d = document.createElement("div"); d.className = cls; d.appendChild(el); chat.appendChild(d); chat.scrollTop = 1e9; return d; }
+function text(s) { return document.createTextNode(s); }
+
+function renderMd(md) {
+  // Minimal renderer for the report shape: headings, tables, bold, inline code, lists.
+  const out = document.createElement("div");
+  const lines = String(md || "").split("\n");
+  let i = 0;
+  const inline = (s) => s
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+  while (i < lines.length) {
+    const ln = lines[i];
+    if (/^#{1,4}\s/.test(ln)) {
+      const h = document.createElement(ln.startsWith("# ") ? "h1" : "h2");
+      h.innerHTML = inline(ln.replace(/^#+\s*/, ""));
+      out.appendChild(h); i++; continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(ln) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const tbl = document.createElement("table");
+      const cells = (s) => s.trim().replace(/^\||\|$/g, "").split("|");
+      const head = cells(ln), body = [];
+      i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { body.push(cells(lines[i])); i++; }
+      const aligns = lines[i - body.length - 1] ? cells(lines[i - body.length - 1]) : [];
+      const tr = document.createElement("tr");
+      head.forEach((c, k) => {
+        const th = document.createElement("th");
+        th.innerHTML = inline(c);
+        if (/^:.*:$/.test((aligns[k] || "").trim()) || aligns[k] && aligns[k].includes("---:")) th.className = "num";
+        tr.appendChild(th);
+      });
+      tbl.appendChild(tr);
+      body.forEach(r => {
+        const row = document.createElement("tr");
+        r.forEach(c => { const td = document.createElement("td"); td.innerHTML = inline(c); row.appendChild(td); });
+        tbl.appendChild(row);
+      });
+      out.appendChild(tbl); continue;
+    }
+    if (/^\s*[-*]\s+/.test(ln)) {
+      const ul = document.createElement("ul");
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        const li = document.createElement("li"); li.innerHTML = inline(lines[i].replace(/^\s*[-*]\s+/, ""));
+        ul.appendChild(li); i++;
+      }
+      out.appendChild(ul); continue;
+    }
+    if (ln.trim()) { const p = document.createElement("div"); p.innerHTML = inline(ln); out.appendChild(p); }
+    i++;
+  }
+  return out;
+}
+
+async function send() {
+  const msg = $("msg").value.trim();
+  if (!msg || $("send").disabled) return;
+  $("msg").value = ""; $("send").disabled = true;
+  const scope = { environment_id: $("env").value.trim(), pipeline_name: $("pipe").value.trim(), auth_tenant: $("tenant").value.trim() };
+  if (!scope.environment_id || !scope.pipeline_name) { alert("Set environment_id and pipeline_name in the header."); $("send").disabled = false; return; }
+
+  const u = document.createElement("div"); u.className = "bubble"; u.appendChild(text(msg)); add(u, "user row");
+  const bot = document.createElement("div"); bot.className = "bubble"; add(bot, "bot row");
+  const status = document.createElement("div"); status.className = "progress"; add(status, "progress");
+  history.push({ role: "user", content: msg });
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "stitcher-config-agent", stream: true, messages: history, stitcher: scope })
+    });
+    if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e?.error?.message || resp.statusText); }
+    const reader = resp.body.getReader(), dec = new TextDecoder();
+    let buf = "", content = "", ui = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2);
+        if (!raw.startsWith("data: ") || raw === "data: [DONE]") continue;
+        const chunk = JSON.parse(raw.slice(6));
+        const st = chunk.stitcher || {};
+        const d = (chunk.choices?.[0] || {}).delta || {};
+        if (st.kind === "tool" || st.kind === "status") {
+          status.innerHTML = "<b>▸</b> " + (st.msg || "").replace(/</g, "&lt;");
+        }
+        if (typeof d.content === "string") content += d.content;
+        if (d.ui && typeof d.ui === "object") ui = d.ui;
+      }
+    }
+    status.remove();
+    if (ui && ui.kind === "chargeback_report") {
+      const art = document.createElement("div"); art.className = "artifact";
+      const head = document.createElement("div"); head.className = "artifact-head";
+      const k = document.createElement("span"); k.className = "chip k"; k.textContent = "chargeback_report"; head.appendChild(k);
+      if (ui.period) { const c = document.createElement("span"); c.className = "chip"; c.textContent = ui.period; head.appendChild(c); }
+      if (ui.destination) { const c = document.createElement("span"); c.className = "chip"; c.textContent = ui.destination; head.appendChild(c); }
+      if (ui.source) { const c = document.createElement("span"); c.className = "chip"; c.textContent = ui.source; head.appendChild(c); }
+      art.appendChild(head);
+      if (ui.markdown) art.appendChild(renderMd(ui.markdown));
+      bot.appendChild(art);
+    }
+    if (content) {
+      const md = document.createElement("div"); md.appendChild(renderMd(content)); bot.appendChild(md);
+    }
+    if (!content && !ui) { const p = document.createElement("div"); p.textContent = "(no response)"; bot.appendChild(p); }
+    history.push({ role: "assistant", content });
+  } catch (err) {
+    status.remove();
+    const e = document.createElement("div"); e.className = "bubble"; e.textContent = "⚠ " + err.message; add(e, "bot row");
+  } finally {
+    $("send").disabled = false; $("msg").focus(); chat.scrollTop = 1e9;
+  }
+}
+$("send").onclick = send;
+$("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+$("msg").focus();
+</script>
+</body>
+</html>
