@@ -48,4 +48,9 @@ def register(mcp: FastMCP) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f)
         os.replace(tmp, path)
-        return f"captured: {len(payload)} bytes -> {path}"
+        return (
+            f"captured: {len(payload)} bytes -> {path}. SUCCESS — the result is recorded. "
+            "Do NOT call submit_result again. Your FINAL message is the only thing the caller "
+            "sees: repeat the full user-facing deliverable there (tables, numbers, paths), then "
+            "end the turn."
+        )

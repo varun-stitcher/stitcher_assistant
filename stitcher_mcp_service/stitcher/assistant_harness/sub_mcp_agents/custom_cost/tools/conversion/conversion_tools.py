@@ -399,7 +399,8 @@ def register(mcp: FastMCP) -> None:
         Args:
             config_json: InlineNormalizeDatasourceDto JSON (e.g. from
               ``normalize_to_focus``'s ``plans[0].config``, ``simulate_normalize_config``
-              round-trip, or a hand-corrected variant).
+              round-trip, or a hand-corrected variant). Accepts a dict OR a JSON string
+              (models routinely hand a stringified payload back — parse, don't refuse).
             name: optional file stem (default: the converter_plan_name).
         """
         t0 = time.time()
@@ -410,6 +411,14 @@ def register(mcp: FastMCP) -> None:
                 "error": message,
                 "elapsed_seconds": round(time.time() - t0, 2),
             }
+
+        if isinstance(config_json, str):
+            try:
+                config_json = json.loads(config_json)
+            except json.JSONDecodeError as e:
+                return _err(f"config_json is a string but not valid JSON ({e}).")
+            if not isinstance(config_json, dict):
+                return _err("config_json (parsed from string) must be a JSON object, not a scalar/array.")
 
         if not isinstance(config_json, dict) or not config_json:
             return _err(
@@ -429,7 +438,7 @@ def register(mcp: FastMCP) -> None:
                 f"could not validate config as InlineNormalizeDatasourceDto: {type(e).__name__}: {str(e)[:500]}"
             )
 
-        from ...common import artifacts
+        from .....common import artifacts
 
         out_dir = artifacts.user_output_dir("FOCUS_CONFIG_OUTPUT_DIR", "stitcher-focus-configs")
         try:

@@ -311,7 +311,9 @@ class AgentRunner:
                 "pi",
                 "-p",
                 "--model",
-                f"stitcher/{model or DEFAULT_MODEL}",
+                # a model containing "/" is used verbatim (e.g. "router/glm53-flash" — a local
+                # router profile); anything else runs on the stitcher gateway provider
+                (model or DEFAULT_MODEL) if "/" in (model or DEFAULT_MODEL) else f"stitcher/{model or DEFAULT_MODEL}",
                 "-e",
                 str(EXT),
                 "-nbt",
