@@ -111,11 +111,22 @@ _wait_mcp() { # $1 = port
 _wait_mcp "$PORT" || { echo "!! combined MCP server did not come up on $PORT" >&2; exit 1; }
 
 echo "stitcher-pi — model ${STITCHER_MODEL_NAME}, base ${STITCHER_MODEL_BASE_URL}, env ${STITCHER_ENVIRONMENT_ID}, pipeline ${STITCHER_PIPELINE_NAME}, MCP via ${STITCHER_MCP_URL}"
+
+# The subagent extension spawns child `pi` processes for delegated tasks. Each child must
+# register the Stitcher provider + MCP tools too, so publish the parent extension path via
+# env (read by pi_extension/subagent/index.ts when building the child argv).
+export STITCHER_PI_EXTENSION="$PIA_DIR/pi_extension/index.ts"
+
 # -nbt / --no-builtin-tools: disable pi's built-in read/write/bash/edit so the agent
 # cannot touch source code or the filesystem directly — it may only use the Stitcher MCP
 # tools proxied in by the extension (list_directory / read_text_file / read_pdf / the
 # chargeback / config-gen / custom-cost bundles). Keeps the agent tool-bound, not a shell.
-pi --model "stitcher/${STITCHER_MODEL_NAME}" -nbt -e "$PIA_DIR/pi_extension/index.ts"
+# Second -e: the subagent extension (delegate long MCP tool sequences to isolated child
+# agents with their own context windows — child agents stay tool-bound via -nbt inside
+# pi_extension/subagent/index.ts).
+pi --model "stitcher/${STITCHER_MODEL_NAME}" -nbt \
+  -e "$PIA_DIR/pi_extension/index.ts" \
+  -e "$PIA_DIR/pi_extension/subagent/index.ts"
 status=$?
 kill "$MCP_PID" 2>/dev/null || true
 exit "$status"

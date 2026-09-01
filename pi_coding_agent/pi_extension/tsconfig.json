@@ -13,7 +13,8 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true
   },
-  "include": ["index.ts", "mcpClient.mjs"]
+  "include": ["index.ts", "mcpClient.mjs", "subagent/**/*.ts"]
 }

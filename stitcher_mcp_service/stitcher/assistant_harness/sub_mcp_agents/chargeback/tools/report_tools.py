@@ -23,6 +23,12 @@ from . import cost_reader as cr
 from . import formatting as fmt
 from .settings import CC_NAMES, get_chargeback_settings
 
+_DIM_DISP = {
+    "cost_center": "cost center",
+    "business_unit": "business unit",
+    "organization": "organization",
+}
+
 
 def _rollup_cost_center(
     df: pl.DataFrame,
@@ -115,11 +121,18 @@ async def _read_cc_frame(
     ``(dc, schema, cost_col, df, period_label, cols, alloc, has_alloc)`` where ``cols`` is
     ``(cc_col, org_col, provider_col)``; raises :class:`cm.ToolRefusal` on every refusal boundary."""
     dc, schema, cost_col = cm.prep_read(soe, tool, data_source, environment_id, cost_column)
-    classification = await cr.classify_org_cost_center(schema)
-    cc_col = await cr.resolve_cost_center_column(schema, cost_center_column, classification)
+    # The grouping dimension comes from the allocation pipeline (cost_center → business_unit →
+    # organization), so a destination WITHOUT a cost center still groups on its business-unit or
+    # organization column instead of a hard cost-center refusal.
+    alloc = await cr.resolve_allocation_dimension(soe, schema, override=cost_center_column)
+    cc_col = alloc.get("column")
+    dim_label = alloc.get("dimension") or "cost_center"
     if not cc_col:
-        raise cm.ToolRefusal(cm.refusal(tool, "cost-center", schema, "cost_center_column"))
-    org_col = await cr.resolve_org_column(schema, org_column, classification) or cc_col
+        raise cm.ToolRefusal(
+            cm.refusal(tool, "cost center / business unit / organization", schema, "cost_center_column")
+        )
+    classification = await cr.classify_org_cost_center(schema, soe=soe)
+    org_col = await cr.resolve_org_column(schema, org_column, classification, soe=soe) or cc_col
     provider_col = cr.resolve_provider_column(schema, provider_column)
     alloc_src, alloc_dst = cr.resolve_allocation_columns(schema)
     period_col = cr.resolve_period_column(schema, period_column)
@@ -145,7 +158,8 @@ async def _read_cc_frame(
         top_n=200,
     )
     has_alloc = bool(alloc_src and alloc_dst)
-    return dc, schema, cost_col, df, period_label, (cc_col, org_col, provider_col), (alloc_src, alloc_dst), has_alloc
+    return (dc, schema, cost_col, df, period_label, (cc_col, org_col, provider_col),
+            (alloc_src, alloc_dst), has_alloc, dim_label)
 
 
 def register(mcp: FastMCP, client, soe) -> None:
@@ -253,6 +267,7 @@ def register(mcp: FastMCP, client, soe) -> None:
                 (cc_col, org_col, provider_col),
                 (alloc_src, alloc_dst),
                 has_alloc,
+                dim_label,
             ) = await _read_cc_frame(
                 soe,
                 tool,
@@ -358,7 +373,7 @@ def register(mcp: FastMCP, client, soe) -> None:
         records = int(df.select(pl.col("row_count").sum()).item() or 0) if "row_count" in df.columns else df.height
         return "\n".join(
             [
-                f"# Chargeback by cost center — {period_label}",
+                f"# Chargeback by {_DIM_DISP.get(dim_label, 'cost center')} — {period_label}",
                 f"source: `{getattr(dc, 'name', data_source)}`  ·  {records:,} charge records in window"
                 + ("" if has_alloc else "  ·  _no allocation columns — direct cost only_"),
                 "",
@@ -406,7 +421,7 @@ def register(mcp: FastMCP, client, soe) -> None:
         """
         tool = "chargeback_provider_lineage"
         try:
-            dc, _schema, cost_col, df, period_label, (cc_col, org_col, provider_col), _alloc, has_alloc = (
+            dc, _schema, cost_col, df, period_label, (cc_col, org_col, provider_col), _alloc, has_alloc, dim_label = (
                 await _read_cc_frame(
                     soe,
                     tool,
