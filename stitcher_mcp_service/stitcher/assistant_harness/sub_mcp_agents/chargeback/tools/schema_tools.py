@@ -215,3 +215,56 @@ def register(mcp: FastMCP, client, soe) -> None:
             lines.append("")
             lines.append("Mapping looks usable — proceed with query_focus_cost or chargeback_by_cost_center.")
         return "\n".join(lines)
+
+    @mcp.tool
+    async def resolve_allocation_dimension(
+        data_source: str = "",
+        override: str = "",
+        environment_id: str | None = None,
+    ) -> str:
+        """Resolve which column to **allocate / group cost by** for this destination.
+
+        Walks an allocation pipeline — **cost_center → business_unit → organization** — so a
+        destination WITHOUT an explicit cost center still gets a defensible grouping column
+        (the customer's ``x_*`` business-unit or organization column). Deterministic index first;
+        an ambiguous top-priority defers to the LLM as a scoped multiple-choice pick. Returns the
+        chosen dimension + column and the full per-dimension readout.
+
+        This is what the report/invoice tools group on; call it before
+        ``chargeback_by_cost_center`` when you are not sure a cost-center column exists.
+
+        Args:
+            data_source: Name or id of the **destination** (omit to auto-resolve the FOCUS lake).
+            override: Skip the pipeline and force a specific column to allocate by.
+            environment_id: Scope.
+        """
+        try:
+            dc, schema, _ = cm.prep_read(
+                soe, "resolve_allocation_dimension", data_source, environment_id, require_cost=False
+            )
+            env_id = cm.resolve_env_id(soe, environment_id)
+        except cm.ToolRefusal as exc:
+            return str(exc)
+        try:
+            res = await cr.resolve_allocation_dimension(soe, schema, override=override or None)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR (resolve_allocation_dimension): {str(e)[:300]}"
+
+        lines = [
+            f"# Allocation dimension — {getattr(dc, 'name', data_source)}  (env {env_id})",
+            "",
+            "Priority: `cost_center` → `business_unit` → `organization`",
+            f"**chosen**: dimension=`{res.get('dimension')}`, column=`{res.get('column') or '(none)'}` "
+            f"(confidence={'HIGH' if res.get('confident') else 'LOW'}, source={res.get('source')})",
+        ]
+        cands = res.get("_candidates") or []
+        if cands:
+            lines.append("")
+            lines.append("## Per-dimension readout")
+            for c in cands:
+                v = c.get("verdict") or "?"
+                lines.append(
+                    f"- **{c.get('dimension')}**: {c.get('column') or '(none)'}  "
+                    f"{v} score={c.get('score', 0):.2f}"
+                )
+        return "\n".join(lines)

@@ -56,14 +56,17 @@ async def _build_chargeback_invoices(
     cost_col = cr.resolve_cost_column(schema, cost_column)
     if not cost_col:
         raise RuntimeError(f"could not identify a cost column. Columns: {', '.join(sorted(schema))}. Pass cost_column.")
-    classification = await cr.classify_org_cost_center(schema)
-    cc_col = await cr.resolve_cost_center_column(schema, cost_center_column, classification)
+    # Grouping dimension from the allocation pipeline (cost_center → business_unit → org) so a
+    # destination without a cost center still bills against its business-unit/org column.
+    alloc = await cr.resolve_allocation_dimension(soe, schema, override=cost_center_column)
+    cc_col = alloc.get("column")
     if not cc_col:
         raise RuntimeError(
-            f"could not identify a cost-center column. Columns: {', '.join(sorted(schema))}. "
-            "Pass cost_center_column (e.g. 'x_CostCenter')."
+            f"could not identify an allocation dimension (cost center / business unit / org) column. "
+            f"Columns: {', '.join(sorted(schema))}. Pass cost_center_column."
         )
-    org_col = await cr.resolve_org_column(schema, org_column, classification) or cc_col
+    classification = await cr.classify_org_cost_center(schema, soe=soe)
+    org_col = await cr.resolve_org_column(schema, org_column, classification, soe=soe) or cc_col
     period_col = cr.resolve_period_column(schema, period_column)
     provider_col = cr.resolve_provider_column(schema, provider_column)
 

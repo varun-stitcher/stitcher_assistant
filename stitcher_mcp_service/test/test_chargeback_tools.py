@@ -211,6 +211,32 @@ def test_period_rejects_invalid(bad):
 
 
 # ── C3: FOCUS fetch mapping + aggregation (destination model) ───────────────
+def test_focus_where_string_period_matches_iso_dates():
+    """REGRESSION (live 2026-08-30): the dev export's period column came back STRING-typed and
+    the old SUBSTR(1,6) branch turned "2026-07-23…" into "2026-0" — silently matching NOTHING,
+    so every period-filtered report returned zero rows (the agent then burned 26 tool calls
+    'diagnosing a date-filtering bug'). The string branch must digit-strip before the YYYYMM
+    prefix compare, for BOTH month codes and ISO timestamps."""
+    from datetime import date
+
+    from stitcher.assistant_harness.sub_mcp_agents.chargeback.tools.cost_reader import _focus_where
+
+    where, params = _focus_where(
+        "bigquery",
+        period_col="ChargePeriodStart",
+        start=date(2026, 7, 1),
+        end=date(2026, 8, 1),
+        filters=None,
+        period_dtype="String",  # string dtype ⇒ the SUBSTR branch
+    )
+    assert "REGEXP_REPLACE" in where, where  # digit-strip, not raw SUBSTR on the ISO string
+    assert [p["value"] for p in params] == ["202607", "202608"]
+    # semantics: an ISO timestamp string yields "202607" → inside; "2026-0" never appears
+    import re as _re
+
+    assert "'2026-0'" not in where
+
+
 def test_focus_query_by_service(server, monkeypatch):
     txt = _call(
         server,
@@ -615,3 +641,116 @@ async def test_resolve_override_beats_classifier():
     schema = {"x_Organization": "String"}
     assert (await cr.resolve_org_column(schema, override="x_custom_org")) == "x_custom_org"
     assert (await cr.resolve_org_column(schema, classification={"organization": "x_Organization"})) == "x_Organization"
+
+
+# ── P: allocation-pipeline grouping (cost_center → business_unit → organization) ──
+#
+# A destination WITHOUT an explicit cost center (but WITH a business-unit or org column) must
+# still group and render — the grouping dimension comes from the allocation pipeline, NOT a hard
+# cost-center requirement. These lock in the behavior so a future refactor can't regress it.
+# Written FIRST (TDD) so the wiring below is proven and stays provable.
+
+_FOCUS_BU_SCHEMA = {
+    "BilledCost": "Float64",
+    "ChargePeriodStart": "Datetime",
+    "ProviderName": "String",
+    "ServiceName": "String",
+    "x_business_unit": "String",
+    "x_Organization": "String",
+}
+
+_FOCUS_BU_ROWS = pl.DataFrame(
+    {
+        "BilledCost": [10.0, 5.0, 30.0],
+        "ChargePeriodStart": [_day1, _day5, _day20],
+        "ProviderName": ["AWS", "AWS", "GCP"],
+        "ServiceName": ["Compute Engine", "Cloud Storage", "Compute Engine"],
+        "x_business_unit": ["bu-alpha", "bu-alpha", "bu-beta"],
+        "x_Organization": ["org-a", "org-a", "org-b"],
+    }
+)
+
+
+def _enable_allocation_index(monkeypatch):
+    """Build an in-memory ColumnSemanticIndex (deterministic pipeline; no store file needed —
+    ``resolve_allocation_dimension`` uses ``pick_allocation`` which never persists)."""
+    from stitcher.assistant_harness.sub_mcp_agents.chargeback.tools.column_semantic_index import (
+        ColumnSemanticIndex,
+        default_backend,
+    )
+
+    monkeypatch.setattr(cr, "COLUMN_INDEX", ColumnSemanticIndex(default_backend()).build())
+
+
+def test_report_groups_by_business_unit_when_no_cost_center(server, monkeypatch):
+    """No cost center, but a business-unit column → chargeback groups by business unit (no
+    cost-center hard refusal), and the report title reflects the actual grouping dimension."""
+    _enable_allocation_index(monkeypatch)
+    txt = _call(
+        server,
+        "chargeback_by_cost_center",
+        {"data_source": "focus"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_BU_SCHEMA,
+        df=_FOCUS_BU_ROWS,
+    )
+    assert "ERR" not in txt
+    assert "# Chargeback by business unit" in txt
+    assert "bu-alpha" in txt
+    assert "bu-beta" in txt
+    assert "$30.00" in txt  # bu-beta is the largest group
+
+
+def test_report_prefers_cost_center_when_present(server, monkeypatch):
+    """Regression guard: with an explicit cost center the pipeline still picks cost center
+    (priority 1), never falls back to business unit/org."""
+    _enable_allocation_index(monkeypatch)
+    txt = _call(
+        server,
+        "chargeback_by_cost_center",
+        {"data_source": "focus"},
+        monkeypatch=monkeypatch,
+        schema=_FOCUS_SVC_SCHEMA,
+        df=_FOCUS_SVC_ROWS,
+    )
+    assert "ERR" not in txt
+    assert "# Chargeback by cost center" in txt
+    assert "cc-120" in txt
+
+
+def test_report_refuses_when_no_grouping_dimension(server, monkeypatch):
+    """No cost center, business unit, or org → honest refusal (never a silent empty table)."""
+    _enable_allocation_index(monkeypatch)
+    txt = _call(
+        server,
+        "chargeback_by_cost_center",
+        {"data_source": "focus"},
+        monkeypatch=monkeypatch,
+        schema={"BilledCost": "Float64", "ChargePeriodStart": "Datetime", "x_tier": "String"},
+        df=pl.DataFrame({"BilledCost": [1.0], "ChargePeriodStart": [_day1], "x_tier": ["t1"]}),
+    )
+    assert "ERR" in txt
+    assert "bu-alpha" not in txt
+
+
+def test_invoice_groups_by_business_unit_when_no_cost_center(monkeypatch):
+    """The invoice builder uses the same allocation dimension: no cost center → one invoice per
+    business unit (instead of refusing)."""
+    _enable_allocation_index(monkeypatch)
+    _patch_cost_reader(monkeypatch, _FOCUS_BU_SCHEMA, _FOCUS_BU_ROWS)
+    invoices, _mat = asyncio.run(
+        invoice_tools._build_chargeback_invoices(
+            _DummySoe(),
+            "focus",
+            date(2025, 6, 1),
+            date(2025, 7, 1),
+            "June 2026",
+            10.0,
+            None,  # cost_center_column override
+            None,  # org_column
+            None,  # cost_column
+            None,  # period_column
+            None,  # provider_column
+        )
+    )
+    assert {i["cost_center"] for i in invoices} == {"bu-alpha", "bu-beta"}

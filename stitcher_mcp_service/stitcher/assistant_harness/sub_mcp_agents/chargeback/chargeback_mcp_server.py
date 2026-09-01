@@ -22,6 +22,7 @@ Run over HTTP (run.sh):   ... --http 8794
 from __future__ import annotations
 
 import argparse
+import pathlib
 
 from fastmcp import FastMCP
 
@@ -52,6 +53,30 @@ def build_server() -> FastMCP:
     # keep the module default ``None`` → deterministic default path.
     if settings.use_stitcher_model and settings.model_api_key:
         cost_reader.LLM_COLUMN_CLASSIFIER = cost_reader._llm_classify_org_cost_center
+        cost_reader.LLM_ALLOCATION_PICKER = cost_reader._llm_pick_allocation
+
+    # Wire the deterministic first path for org/cost-center classification: the
+    # file-backed ColumnSemanticIndex. Build it if the store file is absent, load
+    # it if present (survives restarts). The index is a pure speed/determinism
+    # optimisation — every interaction inside the classifier is wrapped in
+    # try/except and degrades to the LLM / deterministic defaults, so a bad or
+    # missing store can never block chargeback. (Tests, which never call
+    # build_server, keep the module default None → index-less path.)
+    try:
+        from .tools.column_semantic_index import (  # noqa: PLC0415
+            ColumnSemanticIndex,
+            default_backend,
+        )
+
+        store = pathlib.Path(cost_reader.COLUMN_INDEX_STORE_PATH)
+        if store.exists():
+            cost_reader.COLUMN_INDEX = ColumnSemanticIndex.load(store, backend=default_backend())
+        else:
+            store.parent.mkdir(parents=True, exist_ok=True)
+            cost_reader.COLUMN_INDEX = ColumnSemanticIndex(default_backend()).build()
+            cost_reader.COLUMN_INDEX.save(store)
+    except Exception:  # noqa: BLE001 — the index is an optimisation, never a blocker
+        cost_reader.COLUMN_INDEX = None
 
     # Share the top-level assistant_harness/ state dir so the OIDC token minted via the top-level
     # `auth_get_url` is reused here (one login, both servers).

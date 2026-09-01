@@ -116,6 +116,26 @@ export default async function (pi: ExtensionAPI) {
   const subMcpToolNames = new Map<string, string[]>(); // serverName -> [toolName]
   const subMcpByUrl = new Map<string, string>(); // url -> serverName (for listing)
 
+  // Heavy tools: calling these inline floods the orchestrator's context with huge
+  // payloads (multi-page extraction plans, full FOCUS tables, report markdown). The
+  // proxied description gets a delegation nudge so the steering sits exactly where the
+  // model is looking when it decides to call the tool — model-agnostic, not
+  // dependent on prompt guidelines being heeded.
+  const HEAVY_TOOLS = new Set([
+    "extract_invoice",
+    "normalize_to_focus",
+    "validate_and_repair_focus",
+    "chargeback_by_cost_center",
+    "chargeback_by_billing_account",
+    "chargeback_provider_lineage",
+    "query_focus_cost",
+    "generate_chargeback_invoices",
+  ]);
+  const heavy = (name: string) =>
+    HEAVY_TOOLS.has(name)
+      ? " CONTEXT-HEAVY: prefer running this via the subagent tool (agent: \"tool-runner\") instead of inline, so the large result does not consume this conversation's context."
+      : "";
+
   const registerProxiedTool =
     (url: string, serverLabel: string) => (t: { name: string; description: string; inputSchema: JsonSchema }) => {
       if (toolOwnerUrl.has(t.name)) {
@@ -129,7 +149,7 @@ export default async function (pi: ExtensionAPI) {
       pi.registerTool({
         name: t.name,
         label: t.name,
-        description: t.description,
+        description: t.description + heavy(t.name),
         parameters: toTypebox(t.inputSchema),
         async execute(_toolCallId, params, _signal, onUpdate) {
           try {

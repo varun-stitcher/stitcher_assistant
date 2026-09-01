@@ -27,6 +27,7 @@ is computed only when the destination exposes those columns.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Coroutine
 from datetime import date
 from typing import Any
@@ -272,10 +273,14 @@ def _focus_where(engine: str, period_col, start, end, filters, period_dtype) -> 
             where_parts.append(f"CAST({pcol} AS DATETIME) >= @p_start AND CAST({pcol} AS DATETIME) < @p_end")
             params.append({"name": "p_start", "type": "DATETIME", "value": f"{start.isoformat()}T00:00:00"})
             params.append({"name": "p_end", "type": "DATETIME", "value": f"{end.isoformat()}T00:00:00"})
-        else:  # string period (e.g. invoice.month "202506"): match YYYY-MM by prefix
+        else:  # string period — month codes ("202506") AND ISO dates ("2026-07-23T…"): strip
+            # every non-digit, then compare the YYYYMM prefix. (Plain SUBSTR(1,6) mangles ISO
+            # strings — "2026-07-23"[:6] = "2026-0" — silently matching NOTHING. That exact
+            # silent-zero regression hit when the dev export's schema rotated to string periods.)
+            digits = f"REGEXP_REPLACE(CAST({pcol} AS STRING), '[^0-9]', '')"
             ym_start, ym_end = start.strftime("%Y%m"), end.strftime("%Y%m")
             where_parts.append(
-                f"SUBSTR(CAST({pcol} AS STRING), 1, 6) >= @p_start AND SUBSTR(CAST({pcol} AS STRING), 1, 6) < @p_end"
+                f"SUBSTR({digits}, 1, 6) >= @p_start AND SUBSTR({digits}, 1, 6) < @p_end"
             )
             params.append({"name": "p_start", "type": "STRING", "value": ym_start})
             params.append({"name": "p_end", "type": "STRING", "value": ym_end})
@@ -364,6 +369,43 @@ def read_aggregated_cost(
 # falls back to the conventional ``x_*`` defaults. The harness wires the real Stitcher-LLM
 # classifier here in ``build_server``.
 LLM_COLUMN_CLASSIFIER: Callable[[list[str]], Coroutine[Any, Any, dict]] | None = None
+
+# ── optional deterministic first path: file-backed ColumnSemanticIndex ─────────
+# When configured (with an SOE scope), org/cost-center discovery first asks the
+# index (see stitcher_assistant/column_semantic_index.py). The index returns a
+# confident/ambiguous verdict per dimension: confident match or confident refusal
+# is used directly (no LLM turn); an ambiguous dimension falls through to the
+# LLM classifier, whose answer is persisted back (source="llm") so it is paid
+# once. The index must NEVER block chargeback — every interaction is wrapped in
+# try/except and degrades to the LLM / deterministic defaults unchanged.
+COLUMN_INDEX: Any | None = None
+COLUMN_INDEX_STORE_PATH: str = os.path.join(
+    os.path.expanduser("~"), ".stitcher", "column_semantic_index.json"
+)
+
+# Injectable async allocation-dimension picker for the ambiguous case:
+# ``async (candidate_x, pipeline, shortlist) -> dict`` returning {"dimension", "column"}.
+# The deterministic pipeline (cost_center → business_unit → organization) resolves most
+# destinations; when the top priority is only ambiguous, this hook gets a SCOPED shortlist
+# (the candidate  per dimension) so the LLM makes a multiple-choice pick instead of an
+# open-ended classification. The harness wires it in ``build_server``; tests keep None
+# → deterministic best-ambiguous fallback.
+LLM_ALLOCATION_PICKER: Callable[[list[str], tuple, list], Coroutine[Any, Any, dict]] | None = None
+
+
+# lazily import the index module on first use (keeps this module import-light
+# and avoids any import-time coupling to numpy for callers that never use it)
+def _get_column_index() -> Any | None:
+    if COLUMN_INDEX is not None:
+        return COLUMN_INDEX
+    return None
+
+
+def __reimport_column_index() -> Any:
+    """Return the ColumnSemanticIndex class for the harness to configure (build_server)."""
+    from .column_semantic_index import ColumnSemanticIndex, default_backend  # noqa: PLC0415
+
+    return ColumnSemanticIndex, default_backend
 
 
 def _is_provider_prefixed_x(col: str) -> bool:
@@ -490,53 +532,239 @@ async def _llm_classify_org_cost_center(candidate_x: list[str]) -> dict:
     return {"organization_column": result.organization_column, "cost_center_column": result.cost_center_column}
 
 
-async def classify_org_cost_center(schema: dict[str, str]) -> dict:
-    """LLM-classify the destination's ``x_*`` columns into org / cost-center.
+async def classify_org_cost_center(schema: dict[str, str], soe=None) -> dict:
+    """Resolve the destination's ``x_*`` columns into org / cost-center dimensions.
 
-    Input is LIMITED to ``x_*`` column names only (never the full schema), with provider-prefixed
-    ``x_*`` tags filtered out first (they can never be an org/cost-center). Uses the injectable
-    ``LLM_COLUMN_CLASSIFIER`` when set (the harness wires the real Stitcher-LLM classifier);
-    otherwise (unit tests / deterministic core) falls back to the conventional ``x_*`` defaults.
-    A model failure or gateway misconfiguration NEVER blocks chargeback — it degrades to the
-    deterministic default. Returns ``{"organization": col|None, "cost_center": col|None}`` where
+    Order (deterministic-first, LLM-fallback):
+      1. **File-backed index** (when ``COLUMN_INDEX`` is configured and ``soe`` is
+         given): the index returns a confident/ambiguous verdict per dimension. If
+         BOTH dimensions are confident (a trusted match, or a trusted refusal that
+         there is no such dimension), return that and skip the LLM entirely.
+      2. **LLM classifier** (``LLM_COLUMN_CLASSIFIER``): resolves when any dimension
+         is ambiguous (or the index is absent/unconfigured). Its answer is persisted
+         back into the index store (source="llm") so the next call with the same
+         columns is served from the store without another LLM turn.
+      3. **Deterministic ``x_*`` defaults**: the no-LLM, no-index escape hatch.
+
+    A model failure, index error, or gateway misconfiguration NEVER blocks
+    chargeback — it degrades to the next path and finally to the deterministic
+    default. Returns ``{"organization": col|None, "cost_center": col|None}`` where
     values are real schema columns (or None).
     """
     x_cols = sorted(c for c in schema if c.startswith("x_"))
     candidate_x = [c for c in x_cols if not _is_provider_prefixed_x(c)]
     if not candidate_x:
         return {"organization": None, "cost_center": None}
+
+    # Resolve the destination once up-front (for the index cache key + LLM persist).
+    dest_id = ""
+    use_index = COLUMN_INDEX is not None and soe is not None
+    if use_index:
+        try:
+            dest = resolve_destination(soe, "")
+            dest_id = str(getattr(dest, "id", "") or getattr(dest, "name", ""))
+        except Exception:  # noqa: BLE001 — index must never block
+            pass
+
+    # 1) Deterministic first path (both dimensions confident ⇒ done).
+    if use_index and dest_id:
+        try:
+            r = COLUMN_INDEX.match(
+                candidate_x,
+                env_id=getattr(soe, "environment_id", ""),
+                dest_id=dest_id,
+                persist_result=True,
+                path=COLUMN_INDEX_STORE_PATH,
+            )
+            org_m, cc_m = r.organization, r.cost_center
+            org_ok = org_m is None or org_m.confident
+            cc_ok = cc_m is None or cc_m.confident
+            if org_ok and cc_ok:
+                return {
+                    "organization": org_m.column if org_m and org_m.confident else None,
+                    "cost_center": cc_m.column if cc_m and cc_m.confident else None,
+                }
+        except Exception:  # noqa: BLE001 — index must never block
+            pass
+
+    # 2) LLM fallback (resolves ambiguous dimensions; persists its answer).
     if LLM_COLUMN_CLASSIFIER is not None:
         try:
             mapping = await LLM_COLUMN_CLASSIFIER(candidate_x)
             org, cc = _normalize_org_cc(mapping, candidate_x)
             if org is not None or cc is not None:
+                if use_index and dest_id:
+                    try:
+                        COLUMN_INDEX.persist_llm_result(
+                            candidate_x, org, cc,
+                            env_id=getattr(soe, "environment_id", ""),
+                            dest_id=dest_id, path=COLUMN_INDEX_STORE_PATH,
+                        )
+                    except Exception:  # noqa: BLE001 — persist is best-effort
+                        pass
                 return {"organization": org, "cost_center": cc}
         except Exception:  # noqa: BLE001 — a model failure must never block chargeback
             pass
+
+    # 3) Deterministic escape hatch (no LLM, no index).
     return {
         "organization": _pick(schema, _ORG_X_DEFAULTS, None),
         "cost_center": _pick(schema, _COST_CENTER_X_DEFAULTS, None),
     }
 
 
-async def resolve_cost_center_column(schema, override=None, classification=None):
+async def resolve_cost_center_column(schema, override=None, classification=None, soe=None):
     """Resolve a cost-center column. Explicit override wins; else the org/cc classification
     (computed via ``classify_org_cost_center`` when not supplied); else None (caller should ask)."""
     if override:
         return override
     if classification is None:
-        classification = await classify_org_cost_center(schema)
+        classification = await classify_org_cost_center(schema, soe=soe)
     return classification.get("cost_center")
 
 
-async def resolve_org_column(schema, override=None, classification=None):
+async def resolve_org_column(schema, override=None, classification=None, soe=None):
     """Resolve an organization column. Explicit override wins; else the org/cc classification
     (computed via ``classify_org_cost_center`` when not supplied); else None."""
     if override:
         return override
     if classification is None:
-        classification = await classify_org_cost_center(schema)
+        classification = await classify_org_cost_center(schema, soe=soe)
     return classification.get("organization")
+
+
+async def _llm_pick_allocation(candidate_x: list[str], pipeline, shortlist: list | None) -> dict:
+    """Multiple-choice LLM: pick ONE column to allocate cost by, from a shortlist.
+
+    Unlike the org/cost-center classifier (which maps to two fixed dimensions), this
+    asks the model to pick a single grouping key given a SCOPED candidate list and a
+    dimension priority (cost_center → business_unit → organization). Scoping the
+    question to the index's shortlist makes the pick easy and low-variance vs. an
+    open-ended ``which column is the cost center?`` over all 30+ vendor tags.
+    """
+    from pydantic import BaseModel, Field
+
+    class _AllocationPick(BaseModel):
+        dimension: str = Field(
+            default="",
+            description="One of: cost_center, business_unit, organization (the best grouping dimension). Empty if none fit.",
+        )
+        column: str = Field(
+            default="",
+            description="EXACT column name from the candidate list to allocate cost by. Empty if none fit.",
+        )
+
+    from stitcher.pipeline.common.invoice_parser.parser_settings import get_parser_settings
+    from stitcher.pipeline.common.invoice_parser.utils.openai_utils import get_openai_client
+    from stitcher.pipeline.common.pipeline_config_models.ai.common.ai_agent_proxy.base import LLMAgentProxy
+
+    settings = get_parser_settings()
+    effective_model = settings.plan_generation_model
+    client = get_openai_client()
+
+    order = "> ".join(pipeline)
+    lines = "\n".join(f"  - {c.get('column')}  (best fit: {c.get('dimension')}, score {c.get('score', 0):.2f})"
+                     for c in (shortlist or []) if c.get("column"))
+    prompt = (
+        "We bill cloud cost into chargeback groups. Prefer a COST CENTER column; if none exists,\n"
+        "fall back to a BUSINESS UNIT, then an ORGANIZATION. Dimension priority: " + order + ".\n"
+        "Here are the candidate columns ({dim_len}) the deterministic matcher surfaced, each with its\n"
+        "best-fitting dimension:\n" + (lines or "  (no candidates)") + "\n\n"
+        "Pick EXACTLY ONE column from the list to allocate cost by — prefer the highest-priority\n"
+        "dimension that has a clear column. Reply with the chosen dimension and the EXACT column name\n"
+        "(nothing else), or leave both empty if none of them is a defensible grouping dimension."
+    ).format(dim_len=len(shortlist or []) if lines else 0)
+
+    proxy = LLMAgentProxy(
+        model=effective_model,
+        client=client,
+        sai_product="coordination_workflow",
+        sai_product_step="chargeback_allocation_pick",
+    )
+    program = proxy.generate_llamaindex_pydantic_program(
+        base_model=_AllocationPick,
+        prompt_template_str=prompt,
+        model_name=effective_model,
+        attributes={"purpose": "chargeback_allocation_dimension_pick"},
+        seed=42,
+    )
+    result: _AllocationPick = await program.acall()
+    return {"dimension": (result.dimension or "").strip(), "column": (result.column or "").strip()}
+
+
+async def resolve_allocation_dimension(soe, schema: dict[str, str], pipeline=None, override=None) -> dict:
+    """Resolve which column to allocate / group cost by, via an allocation pipeline.
+
+    Priority: explicit override > deterministic index pipeline > LLM multiple-choice >
+    best-ambiguous fallback. ``resolve``
+    Returns ``{"dimension": str|None, "column": str|None, "confident": bool,
+    "source": "explicit"|"index"|"llm"|"fallback"}``. A model/index failure never blocks — it
+    degrades to the best deterministic candidate (or a clear None).
+    """
+    from .column_semantic_index import ALLOCATION_PIPELINE as _PIPE  # noqa: PLC0415
+
+    pipeline = tuple(pipeline) if pipeline else _PIPE
+    if override and override in schema:
+        return {"dimension": "explicit", "column": override, "confident": True, "source": "explicit"}
+
+    x_cols = sorted(c for c in schema if c.startswith("x_"))
+    candidate_x = [c for c in x_cols if not _is_provider_prefixed_x(c)]
+    if not candidate_x:
+        return {"dimension": None, "column": None, "confident": True, "source": "index"}
+
+    shortlist: list | None = None
+    best: dict | None = None
+    # 1) deterministic index pipeline
+    if COLUMN_INDEX is not None and soe is not None:
+        try:
+            best = COLUMN_INDEX.pick_allocation(candidate_x, pipeline)
+            cands_out = (best.get("candidates") or []) if best else []
+            if best.get("confident") and best.get("column"):
+                return {
+                    "dimension": best["dimension"], "column": best["column"],
+                    "confident": True, "source": "index",
+                    "score": best.get("score", 0.0), "_candidates": cands_out,
+                }
+            shortlist = best.get("candidates")
+        except Exception:  # noqa: BLE001 — index must never block
+            shortlist = None
+            cands_out = []
+
+    # 2) LLM multiple-choice over the shortlist
+    if LLM_ALLOCATION_PICKER is not None and (shortlist or candidate_x):
+        try:
+            pick = await LLM_ALLOCATION_PICKER(candidate_x, pipeline, shortlist)
+            col = pick.get("column", "") if isinstance(pick, dict) else ""
+            if col and col in candidate_x:
+                return {
+                    "dimension": pick.get("dimension") or best.get("dimension") if best else None,
+                    "column": col, "confident": True, "source": "llm",
+                    "_candidates": shortlist or [],
+                }
+        except Exception:  # noqa: BLE001 — a model failure must never block
+            pass
+
+    # 3) best deterministic fallback (only if we have a defensible candidate)
+    if best and best.get("column"):
+        return {
+            "dimension": best.get("dimension"), "column": best.get("column"),
+            "confident": best.get("confident", False), "source": "fallback",
+            "score": best.get("score", 0.0), "_candidates": cands_out or [],
+        }
+
+    # 4) conventional x_* defaults — backward-compat escape hatch, parity with the old
+    #    deterministic cost-center/org resolution used when no index/LLM is configured
+    #    (tests, minimal deployments). Picks the highest-priority pipeline dimension whose
+    #    conventional column is present (x_CostCenter first).
+    _defaults = {"cost_center": _COST_CENTER_X_DEFAULTS, "organization": _ORG_X_DEFAULTS}
+    for dim in pipeline:
+        for dcol in _defaults.get(dim, []):
+            if dcol in schema:
+                return {
+                    "dimension": dim, "column": dcol, "confident": True,
+                    "source": "default", "_candidates": shortlist or [],
+                }
+    return {"dimension": None, "column": None, "confident": True, "source": "index", "_candidates": []}
 
 
 def resolve_allocation_columns(schema):
@@ -557,7 +785,12 @@ def resolve_group_by(schema: dict[str, str], group_by: str) -> str | None:
 
 __all__ = [
     "LLM_COLUMN_CLASSIFIER",
+    "LLM_ALLOCATION_PICKER",
+    "COLUMN_INDEX",
+    "COLUMN_INDEX_STORE_PATH",
     "classify_org_cost_center",
+    "resolve_allocation_dimension",
+    "_llm_pick_allocation",
     "list_chargeback_destinations",
     "read_cost_schema",
     "read_aggregated_cost",

@@ -50,6 +50,7 @@ _MCP_SERVICE = _PKG.parent.parent.parent  # .../stitcher_mcp_service/
 ASSISTANT_ROOT = _MCP_SERVICE.parent  # .../stitcher_assistant/
 PIA_DIR = ASSISTANT_ROOT / "pi_coding_agent"  # home of the pi extension + .env.local symlinks
 EXT = PIA_DIR / "pi_extension" / "index.ts"
+SUBAGENT_EXT = PIA_DIR / "pi_extension" / "subagent" / "index.ts"
 SYSTEM_FILE = PIA_DIR / "AGENT_SYSTEM.md"
 RUNS_DIR = PIA_DIR / ".output" / "gateway-runs"
 
@@ -306,6 +307,10 @@ class AgentRunner:
             )
             if auth_tenant:
                 pi_env["STITCHER_AUTH_TENANT"] = auth_tenant
+            # The subagent extension spawns child `pi` processes for delegated tasks; each
+            # child re-registers the Stitcher provider + MCP tools from this path (read by
+            # pi_extension/subagent/index.ts when building the child argv).
+            pi_env["STITCHER_PI_EXTENSION"] = str(EXT)
             system_prompt = SYSTEM_FILE.read_text() if SYSTEM_FILE.exists() else ""
             cmd = [
                 "pi",
@@ -316,6 +321,10 @@ class AgentRunner:
                 (model or DEFAULT_MODEL) if "/" in (model or DEFAULT_MODEL) else f"stitcher/{model or DEFAULT_MODEL}",
                 "-e",
                 str(EXT),
+                # subagent extension: delegate long multi-tool sequences to isolated child
+                # agents (own context windows) so the orchestrator's context stays clean.
+                "-e",
+                str(SUBAGENT_EXT),
                 "-nbt",
                 "--session-id",
                 sid,

@@ -33,6 +33,36 @@ pi (the loop) ──MCP──▶ stitcher.assistant_harness.mcp_server (ONE Fast
 Shared state lives in `OIDCAuth` (`common/oidc_auth.py`) and `StitcherClient`
 (`common/client.py`) in the `stitcher.assistant_harness` package, not globals.
 
+## Sub-agents — keeping the *conversation* context pristine
+
+Dynamic tool loading keeps the **tool list** small; the `subagent` extension keeps the
+**conversation context** small. It is vendored from pi's example extension
+(`pi_extension/subagent/`) and registered alongside the main extension in both launchers
+(`run.sh` and the gateway's `agent_runner.py`).
+
+The tool spawns a **separate `pi` subprocess per delegation** — the child gets its own
+context window, runs the tools there, and returns only its final message to the
+orchestrator. So a 50-page `normalize_to_focus` plan or a 20-tool grounding scan costs the
+top-level agent one compact summary instead of its whole context window.
+
+- **Modes:** single (`{agent, task}`), parallel (`{tasks: [...]}`, max 8 / 4 concurrent),
+  chain (`{chain: [...]}` with a `{previous}` placeholder).
+- **Agents** are markdown files with YAML frontmatter, discovered from `.pi/agents/`
+  (project — checked in) and `~/.pi/agent/agents/` (user):
+  - `tool-runner` — executes a delegated, long-running MCP task end-to-end and returns a
+    compact structured summary (chargeback, normalize_to_focus, config generation, …).
+  - `capability-scout` — read-only recon (which data sources / sub-MCP hosts a capability),
+    returns a distilled shortlist.
+  Add agents by dropping another `.md` in `.pi/agents/` — no extension changes.
+- **Safety adaptations vs. the pi example** (see the header comment in
+  `pi_extension/subagent/index.ts`):
+  - children run with `-nbt` (tool-bound, like the parent — a subagent is never a shell);
+  - children load the same Stitcher extension via `STITCHER_PI_EXTENSION` (registers the
+    `stitcher` provider + MCP tools; set by `run.sh` / `agent_runner.py`);
+  - children never load the subagent extension itself (no recursion);
+  - default agent scope is `both` and the project-agent confirmation prompt is off
+    (first-party trusted repo, headless harness).
+
 ## Sub-MCP servers — keeping the tool list pristine
 
 The agent's visible tool list is kept deliberately small: only the lightweight
